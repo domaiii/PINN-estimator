@@ -14,6 +14,10 @@ class WindNet2D(torch.nn.Module):
     def __init__(self, n_layers: int = 3, hidden_units: int = 20):
         super().__init__()
 
+        self._normalize = False
+        self._xy_lb = torch.tensor([torch.nan, torch.nan])
+        self._xy_ub = torch.tensor([torch.nan, torch.nan])
+
         layers = [
             torch.nn.Linear(2, hidden_units),
             torch.nn.Tanh(),
@@ -27,7 +31,26 @@ class WindNet2D(torch.nn.Module):
 
         self.net = torch.nn.Sequential(*layers)
 
+    def normalize_domain(self, lower_bound: np.ndarray, upper_bound: np.ndarray):
+        if self._normalize:
+            raise RuntimeError("Domain is already normalized.")
+
+        self._normalize = True
+        self._xy_lb = torch.as_tensor(
+            lower_bound,
+            dtype=torch.float32,
+            device=next(self.parameters()).device,
+        )
+        self._xy_ub = torch.as_tensor(
+            upper_bound,
+            dtype=torch.float32,
+            device=next(self.parameters()).device,
+        )
+    
     def forward(self, xy: torch.Tensor) -> torch.Tensor:
+        if self._normalize:
+            xy = 2.0 * (xy - self._xy_lb)/(self._xy_ub - self._xy_lb) - 1.0
+
         return self.net(xy)
 
 
@@ -72,14 +95,14 @@ class PINNLoss(torch.nn.Module):
             "total": self._current_loss_total,
         }
 
-    def components(
+    def forward(
         self,
         uv_pred_data: torch.Tensor,
         uv_data: torch.Tensor,
         w_pred_prior: torch.Tensor,
         xy_prior: torch.Tensor,
         uv_pred_wall: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         u_pred = w_pred_prior[:, 0]
         v_pred = w_pred_prior[:, 1]
         p_pred = w_pred_prior[:, 2]
@@ -106,76 +129,28 @@ class PINNLoss(torch.nn.Module):
         v_xx = grad_vx_dxy[:, 0]
         v_yy = grad_vy_dxy[:, 1]
 
-        data_loss = self.data_loss_fn(uv_pred_data, uv_data)
-        smooth_loss = mean(grad_u_dxy**2 + grad_v_dxy**2)
-        div_loss = torch.mean((u_x + v_y) ** 2)
+        data_loss = self.lambda_data * self.data_loss_fn(uv_pred_data, uv_data)
+        smooth_loss = self.lambda_smooth * mean(grad_u_dxy**2 + grad_v_dxy**2)
+        div_loss = self.lambda_div * torch.mean((u_x + v_y) ** 2)
 
         mom_x = -self.nu * (u_xx + u_yy) + p_x + u_pred * u_x + v_pred * u_y
         mom_y = -self.nu * (v_xx + v_yy) + p_y + u_pred * v_x + v_pred * v_y
-        mom_loss = mean(mom_x**2 + mom_y**2)
-        p_loss = mean(p_pred) ** 2
+        mom_loss = self.lambda_mom * mean(mom_x**2 + mom_y**2)
+        p_loss = self.lambda_p * mean(p_pred) ** 2
 
         if uv_pred_wall is None:
             wall_loss = torch.zeros((), dtype=w_pred_prior.dtype, device=w_pred_prior.device)
         else:
-            wall_loss = torch.mean(uv_pred_wall**2)
+            wall_loss = self.lambda_wall * torch.mean(uv_pred_wall**2)
 
-        return {
-            "data": data_loss,
-            "smooth": smooth_loss,
-            "div": div_loss,
-            "mom": mom_loss,
-            "p": p_loss,
-            "wall": wall_loss,
-        }
+        total = data_loss + smooth_loss + div_loss + mom_loss + p_loss + wall_loss
 
-    def weighted_components(
-        self,
-        uv_pred_data: torch.Tensor,
-        uv_data: torch.Tensor,
-        w_pred_prior: torch.Tensor,
-        xy_prior: torch.Tensor,
-        uv_pred_wall: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        components = self.components(
-            uv_pred_data,
-            uv_data,
-            w_pred_prior,
-            xy_prior,
-            uv_pred_wall=uv_pred_wall,
-        )
-        return {
-            "data": self.lambda_data * components["data"],
-            "smooth": self.lambda_smooth * components["smooth"],
-            "div": self.lambda_div * components["div"],
-            "mom": self.lambda_mom * components["mom"],
-            "p": self.lambda_p * components["p"],
-            "wall": self.lambda_wall * components["wall"],
-        }
-
-    def forward(
-        self,
-        uv_pred_data: torch.Tensor,
-        uv_data: torch.Tensor,
-        w_pred_prior: torch.Tensor,
-        xy_prior: torch.Tensor,
-        uv_pred_wall: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        weighted = self.weighted_components(
-            uv_pred_data,
-            uv_data,
-            w_pred_prior,
-            xy_prior,
-            uv_pred_wall=uv_pred_wall,
-        )
-        total = sum(weighted.values())
-
-        self._current_loss_data = weighted["data"].detach().cpu().item()
-        self._current_loss_smooth = weighted["smooth"].detach().cpu().item()
-        self._current_loss_div = weighted["div"].detach().cpu().item()
-        self._current_loss_mom = weighted["mom"].detach().cpu().item()
-        self._current_loss_p = weighted["p"].detach().cpu().item()
-        self._current_loss_wall = weighted["wall"].detach().cpu().item()
+        self._current_loss_data = data_loss.detach().cpu().item()
+        self._current_loss_smooth = smooth_loss.detach().cpu().item()
+        self._current_loss_div = div_loss.detach().cpu().item()
+        self._current_loss_mom = mom_loss.detach().cpu().item()
+        self._current_loss_p = p_loss.detach().cpu().item()
+        self._current_loss_wall = wall_loss.detach().cpu().item()
         self._current_loss_total = total.detach().cpu().item()
 
         return total
@@ -272,6 +247,9 @@ class PINNWindEstimator:
 
         self.history = TrainingHistory(loss=loss_values)
         return self.history
+    
+    def normalize_domain(self, lower_bound: np.ndarray, upper_bound: np.ndarray):
+        self.model.normalize_domain(lower_bound, upper_bound)
 
     def predict_points(self, xy: np.ndarray) -> np.ndarray:
         xy_t = torch.tensor(xy, dtype=torch.float32, device=self.device)
