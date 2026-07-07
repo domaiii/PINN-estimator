@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     libxext6 \
     xvfb \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
