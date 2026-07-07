@@ -2,36 +2,50 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import time
+import torch
 
 from pinn_wind.io_tools import OccupancyMap, draw_random_samples_csv
 from pinn_wind import pinn
 
+random_seed = 0
+measurement_noise_std = 0.1 # m/s
+n_measurements = 50
+
+
+
 occ = OccupancyMap.from_yaml("data/example_labyrinth/occupancy.yaml")
 measurements = draw_random_samples_csv(
     "/app/data/example_labyrinth/wind_gt.csv",
-    n_samples=50,
+    n_samples=n_measurements,
     random_seed=0,
-    add_noise_std=0.0,
+    add_noise_std=measurement_noise_std,
 )
+
+torch.manual_seed(random_seed)
 
 estimator = pinn.PINNWindEstimator(lambda_wall=0.1, 
                                    lambda_data=1.0,
                                    lambda_smooth=1e-3,
                                    lambda_div=0.1,
                                    lambda_mom=0.1,
-                                   lambda_p=0.0,
+                                   lambda_p=0.1,
                                    learning_rate=1e-2)
 
 lb = occ.points.min(axis=0)
 ub = occ.points.max(axis=0)
-
 estimator.normalize_domain(lb, ub)
-history = estimator.fit(occ, measurements, steps=1000)
+
+t_start = time.time()
+history = estimator.fit(occ, measurements, n_collocation_points=1000, steps=500)
+u_pred, v_pred = estimator.predict_map(occ)
+t_end = time.time()
+elapsed_s = t_end - t_start
 
 print("Weighted loss components:")
 print(estimator.loss_fn.current_losses)
+print(f"Elapsed time for training and prediction: {elapsed_s:.2f} s.")
 
-u_pred, v_pred = estimator.predict_map(occ)
 speed = np.sqrt(u_pred**2 + v_pred**2)
 
 ground_truth = pd.read_csv("/app/data/example_labyrinth/wind_gt.csv")
@@ -43,7 +57,7 @@ print(f"Vector RMSE to ground truth = {vector_rmse:.4f}")
 
 fig, (ax_field, ax_loss) = plt.subplots(1, 2, figsize=(14, 6))
 
-occ.plot(ax=ax_field, title=f"PINN wind estimate, RMSE={vector_rmse:.3f}")
+occ.plot(ax=ax_field, title=f"PINN wind estimate ({n_measurements} samples)")
 
 stream = ax_field.streamplot(
     occ.xx[0, :],
@@ -63,7 +77,7 @@ ax_field.scatter(
     c="black",
     s=18,
     marker="x",
-    label="measurements",
+    label="Measurements",
 )
 ax_field.legend(loc="upper right")
 

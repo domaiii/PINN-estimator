@@ -105,7 +105,7 @@ class OccupancyMap:
             _, ax = plt.subplots(figsize=(8, 5))
 
         values = np.zeros_like(self.occupancy, dtype=float)
-        values[self.solid_mask] = 0.4
+        values[self.solid_mask] = 0.8
 
         half_cell = 0.5 * self.resolution
         extent = (
@@ -124,8 +124,8 @@ class OccupancyMap:
             vmax=1.0,
         )
         ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
         
         if title is not None:
             ax.set_title(title)
