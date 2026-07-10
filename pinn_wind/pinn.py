@@ -63,7 +63,7 @@ class PINNLoss(torch.nn.Module):
         lambda_mom: float = 0.01,
         lambda_p: float = 1.0,
         lambda_wall: float = 1.0,
-        nu: float = 1e-3,
+        nu: float = 1e-5,
     ):
         super().__init__()
         self.data_loss_fn = torch.nn.MSELoss(reduction="mean")
@@ -182,7 +182,7 @@ class PINNWindEstimator:
         lambda_mom: float = 0.01,
         lambda_p: float = 1.0,
         lambda_wall: float = 1.0,
-        nu: float = 1e-3,
+        nu: float = 1e-5,
         device: str | torch.device = "cpu",
     ):
         self.device = torch.device(device)
@@ -223,7 +223,7 @@ class PINNWindEstimator:
         xy_data: np.ndarray,
         uv_data: np.ndarray,
         prior_points: np.ndarray,
-        n_collocation_points: int,
+        n_colloc_pts: int,
         wall_points: np.ndarray | None = None,
         steps: int = 500,
     ) -> TrainingHistory:
@@ -239,23 +239,34 @@ class PINNWindEstimator:
         loss_values = np.zeros(steps, dtype=float)
 
         self.model.train()
+        n_free_pts = colloc_points_t.shape[0]
+        colloc_perm = torch.randperm(n_free_pts, device=self.device)
+        colloc_start_ptr = 0
+
+        if n_colloc_pts > n_free_pts:
+            raise ValueError("Number of collocation points can not be higher than the total count of free points.")
+
         for i in range(steps):
             uv_pred_data = self.model(xy_data_t)[:, :2]
 
-            # Draw collocation points WITH replacement (slightly, but not notably faster)
-            # random_ids = torch.randperm(
+            colloc_end_ptr = colloc_start_ptr + n_colloc_pts 
+            if colloc_end_ptr <= n_free_pts:
+                batch_ids = colloc_perm[colloc_start_ptr:colloc_end_ptr]
+                colloc_start_ptr += n_colloc_pts
+            else:
+                overflow = colloc_end_ptr - n_free_pts 
+                batch_ids = torch.cat([colloc_perm[colloc_start_ptr:],
+                                       colloc_perm[:overflow]])
+                colloc_start_ptr = overflow
+
+            # # Draw collocation points WITHOUT replacement
+            # batch_ids = torch.randint(
             #     colloc_points_t.shape[0],
-            #     device=self.device
-            # )[:n_collocation_points]
+            #     (n_colloc_pts,),
+            #     device=self.device,
+            # )
 
-            # Draw collocation points WITHOUT replacement
-            random_ids = torch.randint(
-                colloc_points_t.shape[0],
-                (n_collocation_points,),
-                device=self.device,
-            )
-
-            xy_collocation = colloc_points_t[random_ids].clone().detach().requires_grad_()
+            xy_collocation = colloc_points_t[batch_ids].clone().detach().requires_grad_()
             w_pred_collocation = self.model(xy_collocation)
 
             uv_pred_wall = None if wall_points_t is None else self.model(wall_points_t)[:, :2]
