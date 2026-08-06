@@ -9,7 +9,7 @@ from pinn_wind.io_tools import OccupancyMap, draw_random_samples_csv
 from pinn_wind import pinn
 
 random_seed = 1
-measurement_noise_std = 0.1 # m/s
+measurement_noise_std = 0.05 # m/s
 n_measurements = 50
 
 def count_parameters(model):
@@ -30,9 +30,9 @@ estimator = pinn.PINNWindEstimator(n_layers=3,
                                    hidden_units=64,
                                    lambda_wall=0.1, 
                                    lambda_data=1.0,
-                                   lambda_smooth=1e-3,
-                                   lambda_div=1.0,
-                                   lambda_mom=1.0,
+                                   lambda_smooth=1e-5,
+                                   lambda_div=0.1,
+                                   lambda_mom=0.1,
                                    lambda_p=1e-3,
                                    learning_rate=5e-3, 
                                    nu=1e-4)
@@ -42,7 +42,7 @@ ub = occ.points.max(axis=0)
 estimator.normalize_domain(lb, ub)
 
 t_start = time.time()
-history = estimator.fit(occ, measurements, n_collocation_points=500, steps=1000)
+history = estimator.fit(occ, measurements, n_collocation_points=1000, steps=1000)
 u_pred, v_pred = estimator.predict_map(occ)
 t_end = time.time()
 elapsed_s = t_end - t_start
@@ -62,10 +62,22 @@ xy_gt = ground_truth[["Points:0", "Points:1"]].to_numpy(dtype=np.float32)
 uv_gt = ground_truth[["U:0", "U:1"]].to_numpy(dtype=np.float32)
 uv_eval = estimator.predict_points(xy_gt)
 vector_rmse = np.sqrt(np.mean(np.sum((uv_eval - uv_gt) ** 2, axis=1)))
+gt_magnitude = np.linalg.norm(uv_gt, axis=1)
+pred_magnitude = np.linalg.norm(uv_eval, axis=1)
+magnitude_error = np.abs(pred_magnitude - gt_magnitude)
+valid_angle = (gt_magnitude > 1e-8) & (pred_magnitude > 1e-8)
+cos_angle = np.sum(uv_eval[valid_angle] * uv_gt[valid_angle], axis=1) / (
+    pred_magnitude[valid_angle] * gt_magnitude[valid_angle]
+)
+angular_error_deg = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+mean_angular_error_deg = np.mean(angular_error_deg)
+mean_magnitude_error = np.mean(magnitude_error)
 print(f"Vector RMSE to ground truth = {vector_rmse:.4f}")
+print(f"Mean angular error = {mean_angular_error_deg:.2f} deg")
+print(f"Mean magnitude error = {mean_magnitude_error:.4f} m/s")
 
-point_error = np.sqrt(np.sum((uv_eval - uv_gt) ** 2, axis=1))
-rmse_map = np.full(occ.occupancy.shape, np.nan, dtype=float)
+gt_u = np.full(occ.occupancy.shape, np.nan, dtype=float)
+gt_v = np.full(occ.occupancy.shape, np.nan, dtype=float)
 gt_cols = np.rint((xy_gt[:, 0] - occ.origin[0]) / occ.resolution - 0.5).astype(int)
 gt_rows = np.rint((xy_gt[:, 1] - occ.origin[1]) / occ.resolution - 0.5).astype(int)
 valid_bounds = (
@@ -76,6 +88,12 @@ valid_bounds = (
 )
 valid_gt = np.zeros_like(valid_bounds, dtype=bool)
 valid_gt[valid_bounds] = occ.free_mask[gt_rows[valid_bounds], gt_cols[valid_bounds]]
+gt_u[gt_rows[valid_gt], gt_cols[valid_gt]] = uv_gt[valid_gt, 0]
+gt_v[gt_rows[valid_gt], gt_cols[valid_gt]] = uv_gt[valid_gt, 1]
+gt_speed = np.sqrt(gt_u**2 + gt_v**2)
+
+point_error = np.sqrt(np.sum((uv_eval - uv_gt) ** 2, axis=1))
+rmse_map = np.full(occ.occupancy.shape, np.nan, dtype=float)
 rmse_map[gt_rows[valid_gt], gt_cols[valid_gt]] = point_error[valid_gt]
 
 half_cell = 0.5 * occ.resolution
@@ -86,16 +104,17 @@ map_extent = (
     occ.yy.max() + half_cell,
 )
 
-fig = plt.figure(figsize=(14, 7), constrained_layout=True)
+fig = plt.figure(figsize=(14, 9), constrained_layout=True)
 gs = fig.add_gridspec(
     2,
     2,
     width_ratios=(1.35, 1.0),
-    height_ratios=(0.65, 1.0),
+    height_ratios=(1.0, 1.0),
     wspace=0.28,
-    hspace=0.35,
+    hspace=0.25,
 )
-ax_field = fig.add_subplot(gs[:, 0])
+ax_field = fig.add_subplot(gs[0, 0])
+ax_gt = fig.add_subplot(gs[1, 0])
 ax_loss = fig.add_subplot(gs[0, 1])
 ax_rmse = fig.add_subplot(gs[1, 1])
 
@@ -112,7 +131,7 @@ stream = ax_field.streamplot(
     linewidth=1.2,
     arrowsize=1.1,
 )
-fig.colorbar(stream.lines, ax=ax_field, label="wind speed")
+
 ax_field.scatter(
     measurements["Points:0"],
     measurements["Points:1"],
@@ -120,8 +139,23 @@ ax_field.scatter(
     s=18,
     marker="x",
     label="Measurements",
+    zorder=6,
 )
-ax_field.legend(loc="upper right")
+#ax_field.legend(loc="upper right")
+
+occ.plot(ax=ax_gt, title="Ground truth wind field")
+gt_stream = ax_gt.streamplot(
+    occ.xx[0, :],
+    occ.yy[:, 0],
+    gt_u,
+    gt_v,
+    color=gt_speed,
+    cmap="coolwarm",
+    density=1.4,
+    linewidth=1.2,
+    arrowsize=1.1,
+)
+fig.colorbar(gt_stream.lines, ax=ax_gt, label="GT wind speed", shrink=0.68)
 
 ax_loss.plot(history.loss, color="orange", lw=2)
 ax_loss.set_title("Training loss")
