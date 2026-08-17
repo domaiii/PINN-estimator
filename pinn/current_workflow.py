@@ -5,8 +5,8 @@ import pandas as pd
 import time
 import torch
 
-from pinn_wind.io_tools import OccupancyMap, draw_random_samples_csv
-from pinn_wind import pinn
+from pinn.io_tools import OccupancyMap, draw_random_samples_csv
+from pinn import pinn
 
 random_seed = 1
 measurement_noise_std = 0.05 # m/s
