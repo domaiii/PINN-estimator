@@ -1,5 +1,6 @@
 jupyterlab
 matplotlib
+meshio
 numpy
 pandas
 scipy
