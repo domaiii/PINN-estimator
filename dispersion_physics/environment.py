@@ -183,6 +183,29 @@ class OccupancyGrid:
 
         return CellType(states[0]) if single_position else states
 
+    def is_strictly_free(self, position: np.ndarray) -> bool:
+        """Return whether a point and every cell touching it are free."""
+        position = np.asarray(position, dtype=float)
+        if position.shape != (2,):
+            raise ValueError("position must have shape (2,)")
+
+        epsilon = self.resolution * 1e-6
+        offsets = epsilon * np.array(
+            [
+                [0.0, 0.0],
+                [-1.0, 0.0],
+                [1.0, 0.0],
+                [0.0, -1.0],
+                [0.0, 1.0],
+                [-1.0, -1.0],
+                [-1.0, 1.0],
+                [1.0, -1.0],
+                [1.0, 1.0],
+            ]
+        )
+        states = self.cell_type_at(position + offsets)
+        return bool(np.all(states == CellType.FREE))
+
     def plot_occupancy(self):
         cmap = colors.ListedColormap(["#303030", "#f2f2f2", "#00a6ff"])
         height, width = self.occupancy.shape

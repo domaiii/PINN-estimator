@@ -1,10 +1,70 @@
-#%%
 import numpy as np
+from dataclasses import dataclass, field
 
 try:
     from environment import WindField, OccupancyGrid, CellType
 except ImportError:
-    from dispersion.environment import WindField, OccupancyGrid, CellType
+    from dispersion_physics.environment import WindField, OccupancyGrid, CellType
+
+@dataclass
+class GasSource:
+    """A Gaussian source emitting filaments at a given rate."""
+
+    position: np.ndarray
+    rate: float
+    filaments_per_sec: float
+    sigma: float
+    _release_remainder: float = field(default=0.0, init=False)
+
+    def __post_init__(self) -> None:
+        self.position = np.asarray(self.position, dtype=float)
+        if self.position.shape != (2,):
+            raise ValueError("source position must have shape (2,)")
+        if self.rate < 0 or self.filaments_per_sec <= 0 or self.sigma < 0:
+            raise ValueError("Invalid gas source parameter")
+
+    def spawn_filaments(
+        self,
+        dt: float,
+        occupancy: OccupancyGrid,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        self._release_remainder += self.filaments_per_sec * dt
+        count = int(self._release_remainder)
+        self._release_remainder -= count
+
+        if count == 0:
+            return np.empty((0, 2)), np.empty(0)
+
+        positions = self._sample_free_positions(count, occupancy)
+        masses = np.full(count, self.rate / self.filaments_per_sec)
+        return positions, masses
+
+    def _sample_free_positions(
+        self,
+        count: int,
+        occupancy: OccupancyGrid,
+    ) -> np.ndarray:
+        accepted = []
+        missing = count
+
+        for _ in range(100):
+            candidates = np.random.normal(
+                loc=self.position,
+                scale=self.sigma,
+                size=(max(2 * missing, 10), 2),
+            )
+            states = occupancy.cell_type_at(candidates)
+            selected = candidates[states == CellType.FREE][:missing]
+            accepted.append(selected)
+            missing -= len(selected)
+
+            if missing == 0:
+                return np.vstack(accepted)
+
+        raise RuntimeError(
+            "Could not spawn enough filaments in free cells. "
+            "The source may be too close to an obstacle."
+        )
 
 
 class GasDispersion:
@@ -13,40 +73,35 @@ class GasDispersion:
     def __init__(
         self,
         wind_field: WindField,
-        source_x: float = 2.0,
-        source_y: float = 2.0,
-        source_sigma: float = 0.1,
-        source_rate: float = 1.0,
-        release_rate: float = 20.0,
+        occupancy: OccupancyGrid,
+        source: GasSource,
         diffusion_speed_std: float = 0.5,
         initial_sigma: float = 0.05,
         diffusivity: float = 1e-2,
         max_age: float = 60.0,
     ):
-        if release_rate <= 0 or initial_sigma <= 0 or diffusivity < 0 or max_age <= 0:
+        if initial_sigma <= 0 or diffusivity < 0 or max_age <= 0:
             raise ValueError("Invalid filament simulation parameter")
 
         self.wind_field = wind_field
-        self.source_x = float(source_x)
-        self.source_y = float(source_y)
-        self.source_sigma = float(source_sigma)
-        self.source_rate = float(source_rate)
-        self.release_rate = float(release_rate)
+        self.occupancy = occupancy
+        self.source = source
         self.diffusion_speed_std = float(diffusion_speed_std)
         self.initial_sigma = float(initial_sigma)
         self.diffusivity = float(diffusivity)
         self.max_age = float(max_age)
 
-        self.occupancy = None
+        if not self.occupancy.is_strictly_free(self.source.position):
+            source_state = self.occupancy.cell_type_at(self.source.position)
+            raise ValueError(
+                f"Source position {self.source.position} is not strictly free "
+                f"(containing cell: {source_state.name})"
+            )
 
         self.time = 0.0
         self.positions = np.empty((0, 2), dtype=float)
         self.ages = np.empty(0, dtype=float)
         self.masses = np.empty(0, dtype=float)
-        self._release_remainder = 0.0
-
-    def create_occupancy_grid(self, mshfile: str, resolution: float = 0.1) -> None:
-        self.occupancy = OccupancyGrid.from_msh_file(mshfile, resolution)
 
     def step(self, dt: float) -> None:
         """Advance the complete simulation by one time step."""
@@ -59,23 +114,14 @@ class GasDispersion:
         self.time += dt
 
     def spawn_filaments(self, dt: float) -> None:
-        self._release_remainder += self.release_rate * dt
-        count = int(self._release_remainder)
-        self._release_remainder -= count
+        spawn, masses = self.source.spawn_filaments(dt, self.occupancy)
+        count = len(spawn)
         if count == 0:
             return
 
-        spawn = np.random.normal(
-            loc=[self.source_x, self.source_y],
-            scale=self.source_sigma,
-            size=(count, 2),
-        )
         self.positions = np.vstack([self.positions, spawn])
         self.ages = np.concatenate([self.ages, np.zeros(count)])
-        mass_per_filament = self.source_rate / self.release_rate
-        self.masses = np.concatenate(
-            [self.masses, np.full(count, mass_per_filament)]
-        )
+        self.masses = np.concatenate([self.masses, masses])
 
     def update_filaments(self, dt: float) -> None:
         if len(self.positions) == 0:
@@ -84,9 +130,6 @@ class GasDispersion:
         velocity = self.wind_field.velocity_at(self.positions)
         velocity += np.random.normal(scale=self.diffusion_speed_std, size=velocity.shape)
         proposed_position_changes = velocity * dt
-
-        if self.occupancy is None:
-            raise RuntimeError("Create an occupancy grid before updating filaments")
 
         new_states = self.occupancy.cell_type_at(
             self.positions + proposed_position_changes
@@ -175,99 +218,3 @@ class GasDispersion:
     @property
     def number_of_filaments(self) -> int:
         return len(self.positions)
-
-
-# %% Minimal live example
-if __name__ == "__main__":
-    from pathlib import Path
-
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
-    from matplotlib.patches import Patch
-    from IPython.display import display
-
-    wind = WindField.from_csv("/app/data/example_labyrinth/wind_gt.csv")
-    gas = GasDispersion(
-        wind_field=wind,
-        source_x = 1.0,
-        source_y = 2.0,
-        source_rate = 1.0,
-        release_rate = 20.0,
-        diffusion_speed_std = 0.7,
-        initial_sigma=0.05,
-        diffusivity=1e-2,
-        max_age=30.0,
-    )
-    gas.create_occupancy_grid(
-        "/app/data/example_labyrinth/labyrinth_2d_fine.msh",
-        resolution=0.1,
-    )
-
-    height, width = gas.occupancy.occupancy.shape
-    x_min, y_min = gas.occupancy.origin
-    extent = [
-        x_min,
-        x_min + width * gas.occupancy.resolution,
-        y_min,
-        y_min + height * gas.occupancy.resolution,
-    ]
-    occupancy_cmap = ListedColormap(["#303030", "#f2f2f2", "#00a6ff"])
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.imshow(
-        gas.occupancy.occupancy,
-        origin="lower",
-        extent=extent,
-        cmap=occupancy_cmap,
-        vmin=-0.5,
-        vmax=2.5,
-        interpolation="nearest",
-        zorder=0,
-    )
-    particles = ax.scatter(
-        [], [], s=10, color="tab:orange", label="filaments", zorder=3
-    )
-    source_marker = ax.scatter(
-        gas.source_x, gas.source_y,
-        marker="x",
-        s=80,
-        color="red",
-        label="source",
-        zorder=4,
-    )
-    ax.set(
-        xlim=(extent[0], extent[1]),
-        ylim=(extent[2], extent[3]),
-        xlabel="x",
-        ylabel="y",
-        aspect="equal",
-    )
-    ax.legend(handles=[
-        particles,
-        source_marker,
-        Patch(color=occupancy_cmap(CellType.FREE), label="free"),
-        Patch(color=occupancy_cmap(CellType.OCCUPIED), label="occupied"),
-        Patch(
-            color=occupancy_cmap(CellType.OPEN_BOUNDARY),
-            label="open boundary",
-        ),
-    ])
-
-    dt = 0.05
-    display_handle = display(fig, display_id=True)
-
-    for step in range(600):
-        gas.step(dt)
-        particles.set_offsets(gas.positions)
-        ax.set_title(
-            f"Gas filaments: t={gas.time:.1f} s, n={gas.number_of_filaments}"
-        )
-
-        # Updating every fifth step keeps inline notebooks responsive.
-        if step % 5 == 0:
-            display_handle.update(fig)
-
-    display_handle.update(fig)
-    plt.close(fig)
-
-# %%
