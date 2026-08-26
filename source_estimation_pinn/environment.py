@@ -14,6 +14,7 @@ class CellType(IntEnum):
     FREE          = 1       # Cell is free (open space)
     OPEN_BOUNDARY = 2       # Cell is an open boundary to outside the environment
 
+
 class WindField:
     """Static 2-D wind field loaded from scattered CSV samples."""
 
@@ -69,6 +70,191 @@ class OccupancyGrid:
         self.occupancy = np.asarray(occupancy, dtype=np.uint8)
         self.resolution = float(resolution)
         self.origin = np.asarray(origin, dtype=float)
+
+        if self.occupancy.ndim != 2:
+            raise ValueError("occupancy must be a 2-D array")
+        if self.resolution <= 0.0:
+            raise ValueError("resolution must be positive")
+        if self.origin.shape != (2,):
+            raise ValueError("origin must have shape (2,)")
+
+    @property
+    def lower_bound(self) -> np.ndarray:
+        return self.origin.copy()
+
+    @property
+    def upper_bound(self) -> np.ndarray:
+        height, width = self.occupancy.shape
+        return self.origin + np.array([width, height]) * self.resolution
+
+    @property
+    def x_centers(self) -> np.ndarray:
+        width = self.occupancy.shape[1]
+        return self.origin[0] + (np.arange(width) + 0.5) * self.resolution
+
+    @property
+    def y_centers(self) -> np.ndarray:
+        height = self.occupancy.shape[0]
+        return self.origin[1] + (np.arange(height) + 0.5) * self.resolution
+
+    @property
+    def xx(self) -> np.ndarray:
+        return np.meshgrid(self.x_centers, self.y_centers)[0]
+
+    @property
+    def yy(self) -> np.ndarray:
+        return np.meshgrid(self.x_centers, self.y_centers)[1]
+
+    @property
+    def points(self) -> np.ndarray:
+        xx, yy = np.meshgrid(self.x_centers, self.y_centers)
+        return np.column_stack((xx.ravel(), yy.ravel()))
+
+    @property
+    def free_mask(self) -> np.ndarray:
+        return self.occupancy == CellType.FREE
+
+    @property
+    def occupied_mask(self) -> np.ndarray:
+        return self.occupancy == CellType.OCCUPIED
+
+    @property
+    def open_boundary_mask(self) -> np.ndarray:
+        return self.occupancy == CellType.OPEN_BOUNDARY
+
+    @property
+    def free_points(self) -> np.ndarray:
+        xx, yy = np.meshgrid(self.x_centers, self.y_centers)
+        return np.column_stack((xx[self.free_mask], yy[self.free_mask]))
+
+    @property
+    def occupied_points(self) -> np.ndarray:
+        xx, yy = np.meshgrid(self.x_centers, self.y_centers)
+        return np.column_stack((xx[self.occupied_mask], yy[self.occupied_mask]))
+
+    @property
+    def wall_mask(self) -> np.ndarray:
+        occupied_neighbor = np.zeros_like(self.free_mask)
+        occupied_neighbor[1:, :] |= self.occupied_mask[:-1, :]
+        occupied_neighbor[:-1, :] |= self.occupied_mask[1:, :]
+        occupied_neighbor[:, 1:] |= self.occupied_mask[:, :-1]
+        occupied_neighbor[:, :-1] |= self.occupied_mask[:, 1:]
+
+        wall_mask = self.free_mask & occupied_neighbor
+        wall_mask[0, :] |= self.free_mask[0, :]
+        wall_mask[-1, :] |= self.free_mask[-1, :]
+        wall_mask[:, 0] |= self.free_mask[:, 0]
+        wall_mask[:, -1] |= self.free_mask[:, -1]
+        return wall_mask
+
+    @property
+    def wall_points(self) -> np.ndarray:
+        xx, yy = np.meshgrid(self.x_centers, self.y_centers)
+        return np.column_stack((xx[self.wall_mask], yy[self.wall_mask]))
+
+    def wall_boundary_samples(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return closed-wall face midpoints and normals pointing out of free space."""
+        free = self.free_mask
+        occupied = self.occupied_mask
+        xx, yy = np.meshgrid(self.x_centers, self.y_centers)
+        centers = np.stack((xx, yy), axis=-1)
+        half_cell = 0.5 * self.resolution
+
+        points = []
+        normals = []
+
+        def add_faces(mask, offset, normal):
+            count = np.count_nonzero(mask)
+            if count == 0:
+                return
+            points.append(centers[mask] + half_cell * np.asarray(offset))
+            normals.append(np.tile(normal, (count, 1)))
+
+        left = np.zeros_like(free)
+        left[:, 1:] = free[:, 1:] & occupied[:, :-1]
+        left[:, 0] = free[:, 0]
+        add_faces(left, (-1.0, 0.0), (-1.0, 0.0))
+
+        right = np.zeros_like(free)
+        right[:, :-1] = free[:, :-1] & occupied[:, 1:]
+        right[:, -1] = free[:, -1]
+        add_faces(right, (1.0, 0.0), (1.0, 0.0))
+
+        bottom = np.zeros_like(free)
+        bottom[1:, :] = free[1:, :] & occupied[:-1, :]
+        bottom[0, :] = free[0, :]
+        add_faces(bottom, (0.0, -1.0), (0.0, -1.0))
+
+        top = np.zeros_like(free)
+        top[:-1, :] = free[:-1, :] & occupied[1:, :]
+        top[-1, :] = free[-1, :]
+        add_faces(top, (0.0, 1.0), (0.0, 1.0))
+
+        if not points:
+            return np.empty((0, 2)), np.empty((0, 2))
+        return np.vstack(points), np.vstack(normals)
+
+    def open_boundary_samples(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return outer open-boundary points and outward unit normals."""
+        open_mask = self.open_boundary_mask
+        covered = np.zeros_like(open_mask)
+        points = []
+        normals = []
+
+        def add(points_for_side, normal):
+            if len(points_for_side) == 0:
+                return
+            points.append(points_for_side)
+            normals.append(np.tile(normal, (len(points_for_side), 1)))
+
+        left = open_mask[:, 0]
+        covered[:, 0] |= left
+        add(
+            np.column_stack((
+                np.full(np.count_nonzero(left), self.lower_bound[0]),
+                self.y_centers[left],
+            )),
+            (-1.0, 0.0),
+        )
+
+        right = open_mask[:, -1]
+        covered[:, -1] |= right
+        add(
+            np.column_stack((
+                np.full(np.count_nonzero(right), self.upper_bound[0]),
+                self.y_centers[right],
+            )),
+            (1.0, 0.0),
+        )
+
+        bottom = open_mask[0, :]
+        covered[0, :] |= bottom
+        add(
+            np.column_stack((
+                self.x_centers[bottom],
+                np.full(np.count_nonzero(bottom), self.lower_bound[1]),
+            )),
+            (0.0, -1.0),
+        )
+
+        top = open_mask[-1, :]
+        covered[-1, :] |= top
+        add(
+            np.column_stack((
+                self.x_centers[top],
+                np.full(np.count_nonzero(top), self.upper_bound[1]),
+            )),
+            (0.0, 1.0),
+        )
+
+        if np.any(open_mask & ~covered):
+            raise ValueError(
+                "Cannot infer normals for OPEN_BOUNDARY cells away from the "
+                "rectangular grid boundary."
+            )
+        if not points:
+            return np.empty((0, 2)), np.empty((0, 2))
+        return np.vstack(points), np.vstack(normals)
 
     @classmethod
     def from_msh_file(cls, path: str | Path, resolution: float) -> "OccupancyGrid":
@@ -206,15 +392,24 @@ class OccupancyGrid:
         states = self.cell_type_at(position + offsets)
         return bool(np.all(states == CellType.FREE))
 
-    def plot_occupancy(self):
+    def plot(
+        self,
+        ax=None,
+        title: str | None = None,
+        output_path: str | Path | None = None,
+        show: bool = False,
+    ):
+        if ax is None:
+            _, ax = pyplot.subplots()
+
         cmap = colors.ListedColormap(["#303030", "#f2f2f2", "#00a6ff"])
-        height, width = self.occupancy.shape
-        x0, y0 = self.origin
         extent = [
-            x0, x0 + width * self.resolution,
-            y0, y0 + height * self.resolution,
+            self.lower_bound[0],
+            self.upper_bound[0],
+            self.lower_bound[1],
+            self.upper_bound[1],
         ]
-        _, ax = pyplot.subplots()
+
         ax.imshow(
             self.occupancy,
             origin="lower",
@@ -224,22 +419,31 @@ class OccupancyGrid:
             vmax=2.5,
             interpolation="nearest",
         )
-
         ax.set_aspect("equal")
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
-        ax.set_title("Occupancy Grid")
+        if title is not None:
+            ax.set_title(title)
+        ax.legend(
+            handles=[
+                Patch(color=cmap(CellType.FREE), label="Free"),
+                Patch(color=cmap(CellType.OCCUPIED), label="Occupied"),
+                Patch(color=cmap(CellType.OPEN_BOUNDARY), label="Open Boundary"),
+            ],
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.15),
+            fancybox=True,
+            ncol=3,
+        )
 
+        if output_path is not None:
+            ax.figure.savefig(output_path, bbox_inches="tight")
+        if show:
+            pyplot.show()
+        return ax
 
-        # Put a legend below current axis
-        ax.legend(handles=[
-            Patch(color=cmap(CellType.FREE), label="Free"),
-            Patch(color=cmap(CellType.OCCUPIED), label="Occupied"),
-            Patch(color=cmap(CellType.OPEN_BOUNDARY), label="Open Boundary"),
-        ],
-        loc='upper center', bbox_to_anchor=(0.5, -0.15),
-                fancybox=True, ncol=3)
-        pyplot.show()
+    def plot_occupancy(self):
+        return self.plot(title="Occupancy Grid", show=True)
 
     @staticmethod
     def points_in_triangle(

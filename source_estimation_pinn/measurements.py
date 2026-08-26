@@ -125,9 +125,10 @@ class WindSampleSet:
         csv_path: str | Path,
         n: int | None = None,
         random_seed: int | None = None,
+        noise_std: float | None = None,
     ) -> "WindSampleSet":
+        """Load wind samples, optionally subsample them and add Gaussian noise."""
         df = pd.read_csv(csv_path)
-        """Draw `n` random samples from a CSV file containing 2D wind field data."""
 
         required_columns = {"Points:0", "Points:1", "U:0", "U:1"}
         if not required_columns.issubset(df.columns):
@@ -136,6 +137,10 @@ class WindSampleSet:
         positions = df[["Points:0", "Points:1"]].to_numpy(float)
         wind_vectors = df[["U:0", "U:1"]].to_numpy(float)
 
+        if noise_std is not None and noise_std < 0.0:
+            raise ValueError("noise_std must be non-negative")
+
+        rng = np.random.default_rng(random_seed)
         if n is not None:
             if not 0 <= n <= len(positions):
                 raise ValueError(
@@ -143,11 +148,13 @@ class WindSampleSet:
                     f"but only {len(positions)} are available."
                 )
 
-            rng = np.random.default_rng(random_seed)
             indices = rng.choice(len(positions), size=n, replace=False)
 
             positions = positions[indices]
             wind_vectors = wind_vectors[indices]
+
+        if noise_std is not None:
+            wind_vectors += rng.normal(0.0, noise_std, wind_vectors.shape)
 
         return cls(positions=positions, wind_vectors=wind_vectors)
 

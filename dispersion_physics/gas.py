@@ -1,70 +1,22 @@
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-try:
-    from environment import WindField, OccupancyGrid, CellType
-except ImportError:
-    from dispersion_physics.environment import WindField, OccupancyGrid, CellType
+from source_estimation_pinn.environment import CellType, OccupancyGrid, WindField
 
 @dataclass
 class GasSource:
-    """A Gaussian source emitting filaments at a given rate."""
+    """Physical parameters of a Gaussian gas source."""
 
     position: np.ndarray
     rate: float
-    filaments_per_sec: float
     sigma: float
-    _release_remainder: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         self.position = np.asarray(self.position, dtype=float)
         if self.position.shape != (2,):
             raise ValueError("source position must have shape (2,)")
-        if self.rate < 0 or self.filaments_per_sec <= 0 or self.sigma < 0:
+        if self.rate < 0 or self.sigma <= 0:
             raise ValueError("Invalid gas source parameter")
-
-    def spawn_filaments(
-        self,
-        dt: float,
-        occupancy: OccupancyGrid,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        self._release_remainder += self.filaments_per_sec * dt
-        count = int(self._release_remainder)
-        self._release_remainder -= count
-
-        if count == 0:
-            return np.empty((0, 2)), np.empty(0)
-
-        positions = self._sample_free_positions(count, occupancy)
-        masses = np.full(count, self.rate / self.filaments_per_sec)
-        return positions, masses
-
-    def _sample_free_positions(
-        self,
-        count: int,
-        occupancy: OccupancyGrid,
-    ) -> np.ndarray:
-        accepted = []
-        missing = count
-
-        for _ in range(100):
-            candidates = np.random.normal(
-                loc=self.position,
-                scale=self.sigma,
-                size=(max(2 * missing, 10), 2),
-            )
-            states = occupancy.cell_type_at(candidates)
-            selected = candidates[states == CellType.FREE][:missing]
-            accepted.append(selected)
-            missing -= len(selected)
-
-            if missing == 0:
-                return np.vstack(accepted)
-
-        raise RuntimeError(
-            "Could not spawn enough filaments in free cells. "
-            "The source may be too close to an obstacle."
-        )
 
 
 class GasDispersion:
@@ -75,17 +27,24 @@ class GasDispersion:
         wind_field: WindField,
         occupancy: OccupancyGrid,
         source: GasSource,
+        filaments_per_sec: float = 20.0,
         diffusion_speed_std: float = 0.5,
         initial_sigma: float = 0.05,
         diffusivity: float = 1e-2,
         max_age: float = 60.0,
     ):
-        if initial_sigma <= 0 or diffusivity < 0 or max_age <= 0:
+        if (
+            filaments_per_sec <= 0
+            or initial_sigma <= 0
+            or diffusivity < 0
+            or max_age <= 0
+        ):
             raise ValueError("Invalid filament simulation parameter")
 
         self.wind_field = wind_field
         self.occupancy = occupancy
         self.source = source
+        self.filaments_per_sec = float(filaments_per_sec)
         self.diffusion_speed_std = float(diffusion_speed_std)
         self.initial_sigma = float(initial_sigma)
         self.diffusivity = float(diffusivity)
@@ -102,6 +61,7 @@ class GasDispersion:
         self.positions = np.empty((0, 2), dtype=float)
         self.ages = np.empty(0, dtype=float)
         self.masses = np.empty(0, dtype=float)
+        self._release_remainder = 0.0
 
     def step(self, dt: float) -> None:
         """Advance the complete simulation by one time step."""
@@ -114,14 +74,40 @@ class GasDispersion:
         self.time += dt
 
     def spawn_filaments(self, dt: float) -> None:
-        spawn, masses = self.source.spawn_filaments(dt, self.occupancy)
-        count = len(spawn)
+        self._release_remainder += self.filaments_per_sec * dt
+        count = int(np.floor(self._release_remainder + 1e-12))
+        self._release_remainder = max(0.0, self._release_remainder - count)
         if count == 0:
             return
 
+        spawn = self._sample_source_positions(count)
+        masses = np.full(count, self.source.rate / self.filaments_per_sec)
         self.positions = np.vstack([self.positions, spawn])
         self.ages = np.concatenate([self.ages, np.zeros(count)])
         self.masses = np.concatenate([self.masses, masses])
+
+    def _sample_source_positions(self, count: int) -> np.ndarray:
+        accepted = []
+        missing = count
+
+        for _ in range(100):
+            candidates = np.random.normal(
+                loc=self.source.position,
+                scale=self.source.sigma,
+                size=(max(2 * missing, 10), 2),
+            )
+            states = self.occupancy.cell_type_at(candidates)
+            selected = candidates[states == CellType.FREE][:missing]
+            accepted.append(selected)
+            missing -= len(selected)
+
+            if missing == 0:
+                return np.vstack(accepted)
+
+        raise RuntimeError(
+            "Could not spawn enough filaments in free cells. "
+            "The source may be too close to an obstacle."
+        )
 
     def update_filaments(self, dt: float) -> None:
         if len(self.positions) == 0:
