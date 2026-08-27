@@ -50,6 +50,96 @@ class WindNet2D(nn.Module):
         return self.net(xy_normalized)
 
 
+class VelocityNet2D(nn.Module):
+    """Approximate a two-dimensional velocity field (x, y) -> (u, v)."""
+
+    def __init__(
+        self,
+        lower_bound: tuple[float, float] | np.ndarray,
+        upper_bound: tuple[float, float] | np.ndarray,
+        hidden_layers: int = 2,
+        hidden_dim: int = 32,
+    ):
+        super().__init__()
+        lower_bound_t = torch.as_tensor(lower_bound, dtype=torch.float32)
+        upper_bound_t = torch.as_tensor(upper_bound, dtype=torch.float32)
+
+        if lower_bound_t.shape != (2,) or upper_bound_t.shape != (2,):
+            raise ValueError("lower_bound and upper_bound must have shape (2,)")
+        if torch.any(upper_bound_t <= lower_bound_t):
+            raise ValueError("upper_bound must be greater than lower_bound")
+        if hidden_layers < 1:
+            raise ValueError("hidden_layers must be at least 1")
+        if hidden_dim < 1:
+            raise ValueError("hidden_dim must be at least 1")
+
+        self.register_buffer("lower_bound", lower_bound_t)
+        self.register_buffer("upper_bound", upper_bound_t)
+
+        layers: list[nn.Module] = [nn.Linear(2, hidden_dim), nn.Tanh()]
+        for _ in range(hidden_layers - 1):
+            layers.extend((nn.Linear(hidden_dim, hidden_dim), nn.Tanh()))
+        layers.append(nn.Linear(hidden_dim, 2))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, xy: Tensor) -> Tensor:
+        xy_normalized = 2.0 * (
+            (xy - self.lower_bound) / (self.upper_bound - self.lower_bound)
+        ) - 1.0
+        return self.net(xy_normalized)
+
+
+class StreamFunctionNet2D(nn.Module):
+    """Represent an exactly divergence-free 2D velocity through a streamfunction."""
+
+    def __init__(
+        self,
+        lower_bound: tuple[float, float] | np.ndarray,
+        upper_bound: tuple[float, float] | np.ndarray,
+        hidden_layers: int = 2,
+        hidden_dim: int = 32,
+    ):
+        super().__init__()
+        lower_bound_t = torch.as_tensor(lower_bound, dtype=torch.float32)
+        upper_bound_t = torch.as_tensor(upper_bound, dtype=torch.float32)
+
+        if lower_bound_t.shape != (2,) or upper_bound_t.shape != (2,):
+            raise ValueError("lower_bound and upper_bound must have shape (2,)")
+        if torch.any(upper_bound_t <= lower_bound_t):
+            raise ValueError("upper_bound must be greater than lower_bound")
+        if hidden_layers < 1:
+            raise ValueError("hidden_layers must be at least 1")
+        if hidden_dim < 1:
+            raise ValueError("hidden_dim must be at least 1")
+
+        self.register_buffer("lower_bound", lower_bound_t)
+        self.register_buffer("upper_bound", upper_bound_t)
+
+        layers: list[nn.Module] = [nn.Linear(2, hidden_dim), nn.Tanh()]
+        for _ in range(hidden_layers - 1):
+            layers.extend((nn.Linear(hidden_dim, hidden_dim), nn.Tanh()))
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, xy: Tensor) -> Tensor:
+        # Velocity is a spatial derivative of psi, so autograd must remain enabled
+        # even while the caller evaluates the model for plotting.
+        with torch.enable_grad():
+            if not xy.requires_grad:
+                xy = xy.detach().requires_grad_(True)
+            xy_normalized = 2.0 * (
+                (xy - self.lower_bound) / (self.upper_bound - self.lower_bound)
+            ) - 1.0
+            psi = self.net(xy_normalized)[:, 0]
+            grad_psi = torch.autograd.grad(
+                psi,
+                xy,
+                grad_outputs=torch.ones_like(psi),
+                create_graph=True,
+            )[0]
+            return torch.stack((grad_psi[:, 1], -grad_psi[:, 0]), dim=1)
+
+
 class PositiveFieldNet(nn.Module):
     """Approximate a positive scalar field over a rectangular 2D domain."""
 

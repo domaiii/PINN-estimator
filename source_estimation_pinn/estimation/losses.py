@@ -235,6 +235,99 @@ class WindDistributionLoss(nn.Module):
         )
 
 
+class StreamFunctionWindLoss(nn.Module):
+    """Wind-data, smoothness, and wall losses for a streamfunction model."""
+
+    def __init__(
+        self,
+        lambda_data: float = 1.0,
+        lambda_smooth: float = 1e-3,
+        lambda_wall: float = 1.0,
+    ):
+        super().__init__()
+        self.lambda_data = lambda_data
+        self.lambda_smooth = lambda_smooth
+        self.lambda_wall = lambda_wall
+
+    def components(
+        self,
+        uv_pred_data: torch.Tensor,
+        uv_data: torch.Tensor,
+        uv_collocation: torch.Tensor,
+        xy_collocation: torch.Tensor,
+        uv_pred_wall: torch.Tensor | None = None,
+        wall_normals: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        data_loss = self.lambda_data * torch.mean(
+            (uv_pred_data - uv_data) ** 2
+        )
+
+        grad_u = torch.autograd.grad(
+            uv_collocation[:, 0],
+            xy_collocation,
+            grad_outputs=torch.ones_like(uv_collocation[:, 0]),
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+        grad_v = torch.autograd.grad(
+            uv_collocation[:, 1],
+            xy_collocation,
+            grad_outputs=torch.ones_like(uv_collocation[:, 1]),
+            create_graph=True,
+        )[0]
+        smooth_loss = self.lambda_smooth * torch.mean(
+            grad_u**2 + grad_v**2
+        )
+
+        # No penetration condition at walls: u.n = 0, where n is the wall normal vector.
+        wall_loss = uv_collocation.new_zeros(())
+        if (
+            uv_pred_wall is not None
+            and uv_pred_wall.numel() > 0
+            and wall_normals is not None
+        ):
+            wall_normal_velocity = torch.sum(
+                uv_pred_wall * wall_normals,
+                dim=1,
+            )
+            wall_loss = self.lambda_wall * torch.mean(
+                wall_normal_velocity**2
+            )
+
+        # # No-slip condition at walls: u = 0.
+    #     wall_loss = uv_collocation.new_zeros(())
+    #     if uv_pred_wall is not None and uv_pred_wall.numel() > 0:
+    #         wall_loss = self.lambda_wall * torch.mean(
+    #             torch.sum(uv_pred_wall**2, dim=1)
+    # )
+
+        return {
+            "wind_data": data_loss,
+            "wind_smooth": smooth_loss,
+            "wind_wall": wall_loss,
+        }
+
+    def forward(
+        self,
+        uv_pred_data: torch.Tensor,
+        uv_data: torch.Tensor,
+        uv_collocation: torch.Tensor,
+        xy_collocation: torch.Tensor,
+        uv_pred_wall: torch.Tensor | None = None,
+        wall_normals: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return sum(
+            self.components(
+                uv_pred_data,
+                uv_data,
+                uv_collocation,
+                xy_collocation,
+                uv_pred_wall,
+                wall_normals,
+            ).values()
+        )
+
+
 class GasSourceLoss(nn.Module):
     def __init__(
         self,

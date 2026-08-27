@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -15,9 +15,10 @@ from .losses import (
     AdvectionDiffusionState,
     GasDistributionLoss,
     GasSourceLoss,
+    StreamFunctionWindLoss,
     WindDistributionLoss,
 )
-from .networks import PositiveFieldNet, WindNet2D
+from .networks import PositiveFieldNet, StreamFunctionNet2D, WindNet2D
 
 
 @dataclass(frozen=True)
@@ -54,28 +55,124 @@ class GasSourceConfig:
 
 
 @dataclass(frozen=True)
-class WindGasSourceConfig(GasSourceConfig):
-    wind_hidden_layers: int = 3
-    wind_hidden_dim: int = 32
-    lambda_wind_data: float = 1.0
-    lambda_wind_smooth: float = 1e-3
+class NavierStokesWindConfig:
+    hidden_layers: int = 3
+    hidden_dim: int = 32
+    lambda_data: float = 1.0
+    lambda_smooth: float = 1e-3
     lambda_div: float = 1e-2
     lambda_momentum: float = 1e-2
     lambda_pressure: float = 1.0
-    lambda_wind_wall: float = 1.0
+    lambda_wall: float = 1.0
     kinematic_viscosity: float = 1e-5
-    wind_learning_rate: float = 1e-3
+    learning_rate: float = 1e-3
 
     def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.wind_hidden_layers < 1:
-            raise ValueError("wind_hidden_layers must be positive")
-        if self.wind_hidden_dim < 1:
-            raise ValueError("wind_hidden_dim must be positive")
+        if self.hidden_layers < 1 or self.hidden_dim < 1:
+            raise ValueError("wind network dimensions must be positive")
         if self.kinematic_viscosity < 0.0:
             raise ValueError("kinematic_viscosity must be non-negative")
-        if self.wind_learning_rate <= 0.0:
-            raise ValueError("wind_learning_rate must be positive")
+        if self.learning_rate <= 0.0:
+            raise ValueError("wind learning_rate must be positive")
+
+
+@dataclass(frozen=True)
+class StreamFunctionWindConfig:
+    hidden_layers: int = 4
+    hidden_dim: int = 64
+    lambda_data: float = 1.0
+    lambda_smooth: float = 1e-3
+    lambda_wall: float = 10.0
+    learning_rate: float = 1e-3
+
+    def __post_init__(self) -> None:
+        if self.hidden_layers < 1 or self.hidden_dim < 1:
+            raise ValueError("wind network dimensions must be positive")
+        if self.learning_rate <= 0.0:
+            raise ValueError("wind learning_rate must be positive")
+
+
+WindConfig = NavierStokesWindConfig | StreamFunctionWindConfig
+
+
+@dataclass(frozen=True)
+class WindGasSourceConfig(GasSourceConfig):
+    wind: WindConfig = field(default_factory=NavierStokesWindConfig)
+
+
+
+def _build_wind_network(
+    bounds: tuple[np.ndarray, np.ndarray],
+    config: WindConfig,
+) -> nn.Module:
+    lower_bound, upper_bound = bounds
+    network_class = (
+        StreamFunctionNet2D
+        if isinstance(config, StreamFunctionWindConfig)
+        else WindNet2D
+    )
+    return network_class(
+        lower_bound,
+        upper_bound,
+        hidden_layers=config.hidden_layers,
+        hidden_dim=config.hidden_dim,
+    )
+
+
+def _build_wind_loss(config: WindConfig) -> nn.Module:
+    if isinstance(config, StreamFunctionWindConfig):
+        return StreamFunctionWindLoss(
+            lambda_data=config.lambda_data,
+            lambda_smooth=config.lambda_smooth,
+            lambda_wall=config.lambda_wall,
+        )
+    return WindDistributionLoss(
+        lambda_data=config.lambda_data,
+        lambda_smooth_w=config.lambda_smooth,
+        lambda_div=config.lambda_div,
+        lambda_mom=config.lambda_momentum,
+        lambda_p=config.lambda_pressure,
+        lambda_wall=config.lambda_wall,
+        nu=config.kinematic_viscosity,
+    )
+
+
+def _wind_loss_components(
+    config: WindConfig,
+    network: nn.Module,
+    loss: nn.Module,
+    xy_data: torch.Tensor,
+    uv_data: torch.Tensor,
+    xy_collocation: torch.Tensor,
+    xy_walls: torch.Tensor,
+    wall_normals: torch.Tensor,
+    pressure_reference_xy: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    wind_collocation = network(xy_collocation)
+    uv_pred_data = network(xy_data)[:, :2]
+    uv_pred_wall = None if len(xy_walls) == 0 else network(xy_walls)[:, :2]
+
+    if isinstance(config, StreamFunctionWindConfig):
+        components = loss.components(
+            uv_pred_data,
+            uv_data,
+            wind_collocation,
+            xy_collocation,
+            uv_pred_wall,
+            wall_normals,
+        )
+        return wind_collocation, components
+
+    p_reference = network(pressure_reference_xy)[:, 2]
+    components = loss.components(
+        uv_pred_data,
+        uv_data,
+        wind_collocation,
+        xy_collocation,
+        uv_pred_wall,
+        p_reference,
+    )
+    return wind_collocation[:, :2], components
 
 
 @dataclass
@@ -128,13 +225,7 @@ class _WindGasSourceModel(_GasSourceModel):
         config: WindGasSourceConfig,
     ):
         super().__init__(bounds, config)
-        lower_bound, upper_bound = bounds
-        self.wind_net = WindNet2D(
-            lower_bound,
-            upper_bound,
-            hidden_layers=config.wind_hidden_layers,
-            hidden_dim=config.wind_hidden_dim,
-        )
+        self.wind_net = _build_wind_network(bounds, config.wind)
 
 
 class _GasSourceEstimatorBase(ABC):
@@ -206,7 +297,7 @@ class _GasSourceEstimatorBase(ABC):
 
     def _require_training_data(self) -> _TrainingData:
         if self._training_data is None:
-            raise RuntimeError("Call prepare(...) or fit(...) first")
+            raise RuntimeError("Call fit(...) first")
         return self._training_data
 
     @abstractmethod
@@ -339,13 +430,142 @@ class _GasSourceEstimatorBase(ABC):
 
         self.model.eval()
         with torch.no_grad():
-            values = network(self._tensor(points)).cpu().numpy()
+            values = network(self._tensor(points)).detach().cpu().numpy()
         return values[0] if single_point else values
 
     def get_source_estimate(self) -> np.ndarray:
         free_points = self.occupancy.free_points
         source_values = self.predict_source(free_points)
         return free_points[int(np.argmax(source_values))].copy()
+
+
+class WindEstimator:
+    """Estimate a wind field from measurements and a selectable physical prior."""
+
+    def __init__(
+        self,
+        occupancy: OccupancyGrid,
+        config: WindConfig | None = None,
+        device: str = "cpu",
+    ):
+        self.occupancy = occupancy
+        self.config = config or NavierStokesWindConfig()
+        self.device = torch.device(device)
+        bounds = (occupancy.lower_bound, occupancy.upper_bound)
+        self.network = _build_wind_network(bounds, self.config).to(self.device)
+        self.loss = _build_wind_loss(self.config).to(self.device)
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=self.config.learning_rate,
+        )
+        self.history: EstimationHistory | None = None
+
+    def _tensor(self, values: np.ndarray) -> torch.Tensor:
+        return torch.as_tensor(
+            values,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    @property
+    def parameter_count(self) -> int:
+        return sum(
+            parameter.numel()
+            for parameter in self.network.parameters()
+            if parameter.requires_grad
+        )
+
+    def fit(
+        self,
+        wind_samples: WindSampleSet,
+        steps: int = 1000,
+        n_collocation_points: int = 1000,
+        callback: Callable[[int, dict[str, float]], None] | None = None,
+    ) -> EstimationHistory:
+        if len(wind_samples.positions) == 0:
+            raise ValueError("wind_samples must not be empty")
+        if steps <= 0:
+            raise ValueError("steps must be positive")
+        if n_collocation_points <= 0:
+            raise ValueError("n_collocation_points must be positive")
+
+        xy_data = self._tensor(wind_samples.positions)
+        uv_data = self._tensor(wind_samples.wind_vectors)
+        xy_free = self._tensor(self.occupancy.free_points)
+        if len(xy_free) == 0:
+            raise ValueError("occupancy grid contains no free points")
+        wall_points, wall_normals = self.occupancy.wall_boundary_samples()
+        xy_walls = self._tensor(wall_points)
+        wall_normals = self._tensor(wall_normals)
+
+        recorded: dict[str, list[float]] = {}
+        self.network.train()
+        for step in range(steps):
+            indices = torch.randint(
+                len(xy_free),
+                (n_collocation_points,),
+                device=self.device,
+            )
+            xy_collocation = xy_free[indices].detach().requires_grad_(True)
+            _, components = _wind_loss_components(
+                self.config,
+                self.network,
+                self.loss,
+                xy_data,
+                uv_data,
+                xy_collocation,
+                xy_walls,
+                wall_normals,
+                xy_free[:1],
+            )
+            losses = {"total": sum(components.values()), **components}
+
+            self.optimizer.zero_grad(set_to_none=True)
+            losses["total"].backward()
+            self.optimizer.step()
+
+            values = {
+                name: value.detach().cpu().item()
+                for name, value in losses.items()
+            }
+            for name, value in values.items():
+                recorded.setdefault(name, []).append(value)
+            if callback is not None:
+                callback(step, values)
+
+        self.history = EstimationHistory(
+            losses={
+                name: np.asarray(values, dtype=float)
+                for name, values in recorded.items()
+            }
+        )
+        return self.history
+
+    def predict_wind(self, xy: np.ndarray) -> np.ndarray:
+        points = np.asarray(xy, dtype=float)
+        single_point = points.ndim == 1
+        points = np.atleast_2d(points)
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("xy must have shape (2,) or (n, 2)")
+
+        self.network.eval()
+        values = self.network(self._tensor(points))[:, :2]
+        result = values.detach().cpu().numpy()
+        return result[0] if single_point else result
+
+    def predict_pressure(self, xy: np.ndarray) -> np.ndarray:
+        if isinstance(self.config, StreamFunctionWindConfig):
+            raise RuntimeError("The streamfunction formulation has no pressure field")
+        points = np.asarray(xy, dtype=float)
+        single_point = points.ndim == 1
+        points = np.atleast_2d(points)
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("xy must have shape (2,) or (n, 2)")
+
+        self.network.eval()
+        values = self.network(self._tensor(points))[:, 2]
+        result = values.detach().cpu().numpy()
+        return result[0] if single_point else result
 
 
 class GasSourceEstimator(_GasSourceEstimatorBase):
@@ -368,27 +588,6 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
         self.wind = wind
         self._known_uv_free: torch.Tensor | None = None
         self._known_xy_inflow: torch.Tensor | None = None
-
-    def prepare(self, gas_samples: GasSampleSet) -> None:
-        self._prepare_common(gas_samples)
-        data = self._require_training_data()
-        free_points = data.xy_free.detach().cpu().numpy()
-        self._known_uv_free = self._tensor(
-            self.wind.velocity_at(free_points)
-        )
-
-        if len(data.xy_open) == 0:
-            self._known_xy_inflow = data.xy_open
-        else:
-            open_points = data.xy_open.detach().cpu().numpy()
-            open_normals = data.open_normals.detach().cpu().numpy()
-            normal_velocity = np.sum(
-                self.wind.velocity_at(open_points) * open_normals,
-                axis=1,
-            )
-            self._known_xy_inflow = self._tensor(
-                open_points[normal_velocity < 0.0]
-            )
 
     def _wind_components(
         self,
@@ -415,7 +614,26 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
         n_collocation_points: int = 1000,
         callback: Callable[[int, dict[str, float]], None] | None = None,
     ) -> EstimationHistory:
-        self.prepare(gas_samples)
+        self._prepare_common(gas_samples)
+        data = self._require_training_data()
+        free_points = data.xy_free.detach().cpu().numpy()
+        self._known_uv_free = self._tensor(
+            self.wind.velocity_at(free_points)
+        )
+
+        if len(data.xy_open) == 0:
+            self._known_xy_inflow = data.xy_open
+        else:
+            open_points = data.xy_open.detach().cpu().numpy()
+            open_normals = data.open_normals.detach().cpu().numpy()
+            normal_velocity = np.sum(
+                self.wind.velocity_at(open_points) * open_normals,
+                axis=1,
+            )
+            self._known_xy_inflow = self._tensor(
+                open_points[normal_velocity < 0.0]
+            )
+
         return self._fit_prepared(steps, n_collocation_points, callback)
 
 
@@ -436,36 +654,19 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         )
         optimizer = torch.optim.Adam([
             {"params": gas_parameters, "lr": config.learning_rate},
-            {"params": model.wind_net.parameters(), "lr": config.wind_learning_rate},
+            {"params": model.wind_net.parameters(), "lr": config.wind.learning_rate},
         ])
         super().__init__(occupancy, config, model, optimizer)
         self.config = config
-        self.wind_distribution_loss = WindDistributionLoss(
-            lambda_data=config.lambda_wind_data,
-            lambda_smooth_w=config.lambda_wind_smooth,
-            lambda_div=config.lambda_div,
-            lambda_mom=config.lambda_momentum,
-            lambda_p=config.lambda_pressure,
-            lambda_wall=config.lambda_wind_wall,
-            nu=config.kinematic_viscosity,
-        ).to(self.device)
+        self.wind_distribution_loss = _build_wind_loss(config.wind).to(
+            self.device
+        )
         self._xy_wind_measurements: torch.Tensor | None = None
         self._uv_measurements: torch.Tensor | None = None
 
     @property
     def _joint_model(self) -> _WindGasSourceModel:
         return self.model  # type: ignore[return-value]
-
-    def prepare(
-        self,
-        gas_samples: GasSampleSet,
-        wind_samples: WindSampleSet,
-    ) -> None:
-        if len(wind_samples.positions) == 0:
-            raise ValueError("wind_samples must not be empty")
-        self._prepare_common(gas_samples)
-        self._xy_wind_measurements = self._tensor(wind_samples.positions)
-        self._uv_measurements = self._tensor(wind_samples.wind_vectors)
 
     def _wind_components(
         self,
@@ -476,27 +677,17 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         if self._xy_wind_measurements is None or self._uv_measurements is None:
             raise RuntimeError("Wind measurements have not been prepared")
 
-        uvp_collocation = self._joint_model.wind_net(xy_collocation)
-        uv_pred_data = self._joint_model.wind_net(
-            self._xy_wind_measurements
-        )[:, :2]
-        uv_pred_wall = (
-            None
-            if len(data.xy_walls) == 0
-            else self._joint_model.wind_net(data.xy_walls)[:, :2]
-        )
-        # Pressure is only defined up to an additive constant. Fix its gauge at
-        # one deterministic free-space point instead of at a random batch mean.
-        p_reference = self._joint_model.wind_net(data.xy_free[:1])[:, 2]
-        components = self.wind_distribution_loss.components(
-            uv_pred_data,
+        return _wind_loss_components(
+            self.config.wind,
+            self._joint_model.wind_net,
+            self.wind_distribution_loss,
+            self._xy_wind_measurements,
             self._uv_measurements,
-            uvp_collocation,
             xy_collocation,
-            uv_pred_wall,
-            p_reference,
+            data.xy_walls,
+            data.wall_normals,
+            data.xy_free[:1],
         )
-        return uvp_collocation[:, :2], components
 
     def _inflow_concentration(
         self,
@@ -519,7 +710,12 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         n_collocation_points: int = 1000,
         callback: Callable[[int, dict[str, float]], None] | None = None,
     ) -> EstimationHistory:
-        self.prepare(gas_samples, wind_samples)
+        if len(wind_samples.positions) == 0:
+            raise ValueError("wind_samples must not be empty")
+        self._prepare_common(gas_samples)
+        self._xy_wind_measurements = self._tensor(wind_samples.positions)
+        self._uv_measurements = self._tensor(wind_samples.wind_vectors)
+
         return self._fit_prepared(steps, n_collocation_points, callback)
 
     def predict_wind(self, xy: np.ndarray) -> np.ndarray:
@@ -527,5 +723,32 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         return values[..., :2]
 
     def predict_pressure(self, xy: np.ndarray) -> np.ndarray:
+        if isinstance(self.config.wind, StreamFunctionWindConfig):
+            raise RuntimeError("The streamfunction formulation has no pressure field")
         values = self._predict(self._joint_model.wind_net, xy)
         return values[..., 2]
+
+    def predict_wind_divergence(self, xy: np.ndarray) -> np.ndarray:
+        """Evaluate du/dx + dv/dy at one or multiple positions."""
+        points = np.asarray(xy, dtype=float)
+        single_point = points.ndim == 1
+        points = np.atleast_2d(points)
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("xy must have shape (2,) or (n, 2)")
+
+        self.model.eval()
+        xy_tensor = self._tensor(points).detach().requires_grad_(True)
+        uv = self._joint_model.wind_net(xy_tensor)[:, :2]
+        grad_u = torch.autograd.grad(
+            uv[:, 0],
+            xy_tensor,
+            grad_outputs=torch.ones_like(uv[:, 0]),
+            retain_graph=True,
+        )[0]
+        grad_v = torch.autograd.grad(
+            uv[:, 1],
+            xy_tensor,
+            grad_outputs=torch.ones_like(uv[:, 1]),
+        )[0]
+        divergence = (grad_u[:, 0] + grad_v[:, 1]).detach().cpu().numpy()
+        return divergence[0] if single_point else divergence
