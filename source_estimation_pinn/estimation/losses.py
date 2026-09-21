@@ -151,9 +151,12 @@ class WindDistributionLoss(nn.Module):
         v_x, v_y = grad_v_dxy[:, 0], grad_v_dxy[:, 1]
         p_x, p_y = grad_p_dxy[:, 0], grad_p_dxy[:, 1]
 
-        data_loss = self.lambda_data * torch.mean(
-            (uv_pred_data - uv_data) ** 2
-        )
+        if uv_data.numel() == 0:
+            data_loss = uvp_collocation.new_zeros(())
+        else:
+            data_loss = self.lambda_data * torch.mean(
+                (uv_pred_data - uv_data) ** 2
+            )
         smooth_loss = self.lambda_smooth_w * torch.mean(
             grad_u_dxy**2 + grad_v_dxy**2
         )
@@ -258,9 +261,12 @@ class StreamFunctionWindLoss(nn.Module):
         uv_pred_wall: torch.Tensor | None = None,
         wall_normals: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        data_loss = self.lambda_data * torch.mean(
-            (uv_pred_data - uv_data) ** 2
-        )
+        if uv_data.numel() == 0:
+            data_loss = uv_collocation.new_zeros(())
+        else:
+            data_loss = self.lambda_data * torch.mean(
+                (uv_pred_data - uv_data) ** 2
+            )
 
         grad_u = torch.autograd.grad(
             uv_collocation[:, 0],

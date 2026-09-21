@@ -186,8 +186,23 @@ class PositiveFieldNet(nn.Module):
         with torch.no_grad():
             self.net[-1].bias.fill_(np.log(np.expm1(max(initial_value, 1e-8))))
 
-    def forward(self, xy: Tensor) -> Tensor:
+    def last_hidden_features(self, xy: Tensor) -> Tensor:
+        """Return the output of the final hidden layer."""
+        if xy.ndim != 2 or xy.shape[1] != 2:
+            raise ValueError("xy must have shape (n, 2)")
+
         xy_normalized = 2.0 * (
             (xy - self.lower_bound) / (self.upper_bound - self.lower_bound)
         ) - 1.0
-        return nn.functional.softplus(self.net(xy_normalized)[:, 0])
+        return self.net[:-1](xy_normalized)
+
+    def eval_last_layer(self, features: Tensor) -> Tensor:
+        """Evaluate the final linear layer on precomputed features."""
+        return self.net[-1](features)[:, 0]
+
+    def raw_output(self, xy: Tensor) -> Tensor:
+        """Return the scalar output before the softplus activation."""
+        return self.eval_last_layer(self.last_hidden_features(xy))
+
+    def forward(self, xy: Tensor) -> Tensor:
+        return nn.functional.softplus(self.raw_output(xy))

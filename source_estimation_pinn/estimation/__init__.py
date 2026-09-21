@@ -1,13 +1,12 @@
-from .estimator import (
+from .configs import (
     EstimationHistory,
     GasSourceConfig,
-    GasSourceEstimator,
     NavierStokesWindConfig,
     StreamFunctionWindConfig,
-    WindEstimator,
+    WindConfig,
     WindGasSourceConfig,
-    WindGasSourceEstimator,
 )
+from .gas_source_estimator import GasSourceEstimator, WindGasSourceEstimator
 from .losses import (
     AdvectionDiffusionState,
     GasDistributionLoss,
@@ -15,7 +14,13 @@ from .losses import (
     StreamFunctionWindLoss,
     WindDistributionLoss,
 )
-from .networks import PositiveFieldNet, StreamFunctionNet2D, VelocityNet2D, WindNet2D
+from .networks import (
+    PositiveFieldNet,
+    StreamFunctionNet2D,
+    VelocityNet2D,
+    WindNet2D,
+)
+from .wind_estimator import WindEstimator
 
 __all__ = [
     "AdvectionDiffusionState",
@@ -30,6 +35,7 @@ __all__ = [
     "StreamFunctionWindConfig",
     "StreamFunctionWindLoss",
     "VelocityNet2D",
+    "WindConfig",
     "WindDistributionLoss",
     "WindEstimator",
     "WindGasSourceConfig",
