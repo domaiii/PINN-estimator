@@ -475,9 +475,20 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
         )
         return sum(components.values()) + prior_loss
 
-    def source_uncertainty_reduction(self, xy: np.ndarray) -> torch.Tensor:
-        """Score candidate concentration measurements assuming known, fixed wind."""
-        return self.laplace.source_uncertainty_reduction(self._tensor(xy))
+    def source_uncertainty_reduction(
+        self,
+        xy: np.ndarray,
+        source_eval_points: np.ndarray | None = None,
+    ) -> torch.Tensor:
+        """Score candidates by mean source-field variance reduction, with fixed wind.
+
+        By default, evaluate source uncertainty on every free occupancy cell.
+        """
+        if source_eval_points is None:
+            source_eval_points = self.occupancy.free_points
+        return self.laplace.source_uncertainty_reduction(
+            self._tensor(xy), self._tensor(source_eval_points)
+        )
 
 
 class WindGasSourceEstimator(_GasSourceEstimatorBase):

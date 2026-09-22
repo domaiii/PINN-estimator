@@ -206,6 +206,26 @@ def test_concentration_gradient_wrt_ll_params(fitted_estimator):
     assert torch.isfinite(gradient).all()
     torch.testing.assert_close(gradient, expected)
 
+
+def test_source_gradient_wrt_ll_params(fitted_estimator):
+    estimator = fitted_estimator
+    xy = estimator._tensor([[0.5, 0.5], [1.0, 1.0], [1.5, 1.5]])
+    gradient = estimator.laplace.source_gradient_wrt_parameters(xy)
+
+    layer = estimator.model.q_net.net[-1]
+    expected_rows = []
+    for point in xy:
+        source = estimator.model.q_net(point[None, :]).sum()
+        weight_gradient, bias_gradient = torch.autograd.grad(
+            source, (layer.weight, layer.bias)
+        )
+        expected_rows.append(torch.cat([
+            weight_gradient.reshape(-1), bias_gradient.reshape(-1)
+        ]))
+
+    assert gradient.shape == (len(xy), layer.in_features + 1)
+    torch.testing.assert_close(gradient, torch.stack(expected_rows))
+
 def test_uncertainty_reduction_score(fitted_estimator):
     xy = np.array([[0.5, 0.5], [1.0, 1.0], [1.5, 1.5]])
     score = fitted_estimator.source_uncertainty_reduction(xy)
@@ -232,8 +252,8 @@ def test_uncertainty_reduction_known_covariance(estimator, monkeypatch, coupled)
     covariance = torch.eye(n_c + n_q, device=estimator.device)
     covariance[n_c:, n_c:] *= 2.0
     if coupled:
-        covariance[n_c, 0] = 1.0
-        covariance[0, n_c] = 1.0
+        covariance[n_c, 0] = 0.5
+        covariance[0, n_c] = 0.5
     estimator.laplace.covariance = covariance
 
     gradients = covariance.new_zeros((3, n_c))
@@ -243,10 +263,18 @@ def test_uncertainty_reduction_known_covariance(estimator, monkeypatch, coupled)
     monkeypatch.setattr(
         estimator.laplace, "concentration_gradient_wrt_parameters", lambda xy: gradients
     )
+    def source_gradients(points):
+        result = covariance.new_zeros((len(points), n_q))
+        result[:, 0] = 1.0
+        return result
+
+    monkeypatch.setattr(
+        estimator.laplace, "source_gradient_wrt_parameters", source_gradients
+    )
 
     xy = np.array([[0.5, 0.5], [1.0, 1.0], [1.5, 1.5]])
     scores = estimator.source_uncertainty_reduction(xy)
-    expected = covariance.new_tensor([1.0, 0.0, 0.5] if coupled else [0.0] * 3)
+    expected = covariance.new_tensor([0.25, 0.0, 0.125] if coupled else [0.0] * 3)
     assert scores.shape == (3,)
     torch.testing.assert_close(scores, expected)
 

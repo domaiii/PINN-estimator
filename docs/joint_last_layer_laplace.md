@@ -1,394 +1,367 @@
-# Quellenunsicherheitsbasierte Gasexplorationsstrategie basierend auf Last-Layer-Laplace-Approximation für Konzentration und Gasquelle
+# Quellenunsicherheitsbasierte Gasexploration mit gemeinsamer Last-Layer-Laplace-Approximation
 
-Nach dem Training liefern das Konzentrationsnetz-MLP $c$ und das Quellen-MLP $q$ des PINN zunächst nur
-jeweils eine optimale Feldschätzung 
+## Ziel: Auswahl des nächsten Messpunkts
+
+Wir betrachten ein Gebiet $\Omega\subset\mathbb R^2$. Das trainierte PINN
+liefert darin Schätzungen der Konzentration $c(x)$ und der Quellenstärke
+$q(x)$. Beide Netze sind insbesondere über den Residual der stationären
+Advektions-Diffusions-Gleichung
+
 $$
-c(x)\geq 0,
+-D\Delta c+\mathbf u\cdot\nabla c-q=0
+$$
+
+im gemeinsamen Loss gekoppelt. Dabei sind $D>0$ der konstante
+Diffusionskoeffizient und $\mathbf u$ das bekannte, festgehaltene
+Geschwindigkeitsfeld. Die räumlichen Operatoren $\nabla$ und $\Delta$
+bezeichnen Gradient und Laplace-Operator.
+
+Für die aktive Exploration suchen wir den Messpunkt, an dem eine
+Konzentrationsmessung die Unsicherheit des Quellenfeldes voraussichtlich
+am stärksten reduziert. Sei $\mathcal X\subset\Omega$ eine nichtleere,
+endliche Menge erreichbarer Messkandidaten und seien
+$r_1,\ldots,r_M\in\Omega$ feste Auswertungspunkte mit $M\geq1$.
+
+Eine zukünftige Konzentrationsmessung bei $x$ modellieren wir als
+
+$$
+y_x=c(x)+\eta_x,
 \qquad
-q(x)\geq 0.
-$$
-basierend auf den bisherigen Messungen und
-den gegebenen Loss-Priors. Das Konzentrationsnetz approximiert also $x\mapsto c(x)$, das Quellennetz
-approximiert $x\mapsto q(x)$. Beide Netze sind
-insbesondere durch die stationäre Advektions-Diffusions-Gleichung gekoppelt:
-
-$$
--D\Delta c
-+\mathbf u\cdot\nabla c
--q
-=0.
+\eta_x\sim\mathcal N(0,\sigma_{\mathrm{obs}}^2),
 $$
 
-## Suche des nächsten optimalen Messpunktes
+mit bekanntem, von den Feldern unabhängigem Messrauschen und
+$\sigma_{\mathrm{obs}}^2>0$.
 
-Für eine aktive Exploration benötigen wir nun
-ein Maß für die Unsicherheit der bisherigen Quellenschätzung, um zu beurteilen,
-an welcher Position eine Konzentrationsmessung diese Unsicherheit
-voraussichtlich am stärksten reduzieren würde.
-
-Eine vollständige bayessche Behandlung würde sämtliche Gewichte und Biases
-beider neuronaler Netze als unsicher betrachten. 
-
-Daher nutzen wir eine Last-Layer-Laplace-Approximation, eine bewusste Vereinfachung dieses Vorgehens.
-Nach dem normalen Training werden die Hidden Layers beider Netze eingefroren.
-Sie dienen anschließend als feste, bereits gelernte Featureabbildungen:
+Gesucht ist ein Messpunkt, der die erwartete verbleibende Quellenvarianz
+im Mittel über die Auswertungspunkte minimiert:
 
 $$
-x\longmapsto h_c(x),
-\qquad
-x\longmapsto h_q(x).
+x_{\mathrm{next}}
+\in
+\arg\min_{x\in\mathcal X}
+\mathbb E_{y_x}\!\left[
+\frac1M\sum_{j=1}^{M}
+\operatorname{Var}[q(r_j)\mid y_x]
+\right].
 $$
 
-Als unsicher behandeln wir nur noch die Gewichte und den Bias des jeweils
-letzten linearen Layers.
+Alle Varianzen und Kovarianzen beziehen sich auf die Unsicherheit nach
+Berücksichtigung der bisherigen Messdaten und der Modellannahmen.
+Die dafür benötigte Verteilung der Feldvorhersagen konstruieren wir
+weiter unten.
+
+Unter einer gemeinsamen Gaußapproximation gilt
+
+$$
+\operatorname{Var}[q(r)\mid y_x]
+=
+\operatorname{Var}[q(r)]
+-
+\frac{
+\operatorname{Cov}[q(r),c(x)]^2
+}{
+\operatorname{Var}[c(x)]+\sigma_{\mathrm{obs}}^2
+}.
+$$
+
+Die verbleibende Varianz hängt in dieser Approximation vom Messort,
+aber nicht vom tatsächlich beobachteten Messwert ab. Der Erwartungswert
+entfällt daher. Außerdem hängt die bisherige Quellenvarianz
+$\operatorname{Var}[q(r)]$ nicht vom Messkandidaten $x$ ab.
+
+Wir können somit statt der verbleibenden Varianz ihre Verringerung
+maximieren:
+
+$$
+\boxed{
+x_{\mathrm{next}}
+\in
+\arg\max_{x\in\mathcal X}
+\frac1M\sum_{j=1}^{M}
+\frac{
+\operatorname{Cov}[q(r_j),c(x)]^2
+}{
+\operatorname{Var}[c(x)]+\sigma_{\mathrm{obs}}^2
+}.
+}
+$$
+
+**Zur Berechnung von $x_{\mathrm{next}}$ benötigen wir also zwei Größen:**
+die Konzentrationsvarianz $\operatorname{Var}[c(x)]$ und die
+Kreuzkovarianz $\operatorname{Cov}[q(r_j),c(x)]$. Das trainierte PINN
+liefert zunächst nur feste Feldschätzungen. Deshalb approximieren wir
+nun die gemeinsame Parameterunsicherheit beider Netze und übertragen
+sie anschließend auf diese beiden Größen.
+
+## Gemeinsame Parameterunsicherheit
+
+### Warum eine gemeinsame Last-Layer-Approximation?
+
+Um die benötigten Varianzen und Kovarianzen zu erhalten, betrachten wir
+die Netzparameter als unsicher. Eine Laplace-Approximation für sämtliche
+Parameter wäre jedoch aufwendig. Deshalb halten wir nach dem Training
+die Hidden Layers fest und betrachten nur die Gewichte und Biases der
+letzten affinen Layer als unsicher.
 
 ![Aufbau der gemeinsamen Last-Layer-Laplace-Approximation](assets/joint_last_layer_laplace_architecture.svg)
 
-
-Gesucht ist der Punkt, an dem das Bekanntwerden der tatsächlichen Konzentration
-$c(x)$ die Summe der verbleibenden Varianzen der Last-Layer-Quellenparameter
+Die festen Hidden Layers liefern die Featurevektoren
 
 $$
-\theta_q=(w_{q1},\ldots,w_{qm},b_q)^\top
+h_c(x)\in\mathbb R^{m_c},
+\qquad
+h_q(x)\in\mathbb R^{m_q},
 $$
 
-minimiert:
+Die Last-Layer-Parameter fassen wir zusammen als
 
 $$
-\boxed{
-x_{\mathrm{next}}
-=
-\arg\min_x
-\operatorname{tr}
-\left(
-\operatorname{Cov}[\theta_q\mid c(x)]
-\right)
-}
-$$
-
-### Bedingte Kovarianz
-
-Unter der gemeinsamen Gaußapproximation von $\theta_q$ und $c(x)$ ist die bedingte Kovarianz 
-$\operatorname{Cov}[\theta_q\mid c(x)]$ ein Maß für die verbleibende Unsicherheit der 
-Quellenparameter $\theta_q$ unter der Bedingung, dass $c(x)$ bekannt wird. Sie lässt sich
-folgendermaßen berechnen:
-
-$$
-\operatorname{Cov}[\theta_q\mid c(x)]
-=
-\Sigma_{qq}
--
-\operatorname{Cov}[\theta_q,c(x)]
-\operatorname{Var}[c(x)]^{-1}
-\operatorname{Cov}[c(x),\theta_q].
-$$
-
-Hier ist $\Sigma_{qq}=\operatorname{Cov}[\theta_q]$. Da $c(x)$ skalar ist und
-
-$$
-\operatorname{Cov}[c(x),\theta_q]
-=
-\operatorname{Cov}[\theta_q,c(x)]^\top,
-$$
-
-folgt
-
-$$
-\boxed{
-\operatorname{Cov}[\theta_q\mid c(x)]
-=
-\Sigma_{qq}
--
-\frac{
-\operatorname{Cov}[\theta_q,c(x)]
-\operatorname{Cov}[\theta_q,c(x)]^\top
-}{
-\operatorname{Var}[c(x)]
-}
-}.
-$$
-
-Da jedoch $\Sigma_{qq}$ nicht von $x$ abhängt folgt durch das Anwenden der Spur:
-
-$$
-\operatorname{tr}\left(\operatorname{Cov}[\theta_q\mid c(x)]\right)
-=
-\operatorname{tr}(\Sigma_{qq})
--
-\frac{
-\left\|\operatorname{Cov}[\theta_q,c(x)]\right\|_2^2
-}{
-\operatorname{Var}[c(x)]
-}.
-$$
-
-Damit ist die ursprüngliche Minimierung äquivalent zu
-
-$$
-\boxed{
-x_{\mathrm{next}}
-=
-\arg\max_x
-\frac{
-\left\|\operatorname{Cov}[\theta_q,c(x)]\right\|_2^2
-}{
-\operatorname{Var}[c(x)]
-}
-}.
-$$
-
-Für die Bestimmung des optimalen nächsten Messpunktes werden somit benötigt:
-
-- $\operatorname{Var}[c(x)]$: die Unsicherheit der Konzentrationsprognose bei $x$,
-- $\operatorname{Cov}[\theta_q,c(x)]$: die Kopplung zwischen den
-  Last-Layer-Quellenparametern und der Konzentration bei $x$.
-
-
-## Bestimmung der Unsicherheit der Konzentrationsprognose an einer Stelle $x$
-
-$\operatorname{Var}[c(x)]$ beschreibt, wie unsicher die
-Konzentrationsprognose des bisher trainierten Netzes an einem festen Kandidatenpunkt
-$x$ ist. Zu ihrer Bestimmung wird die Unsicherheit der trainierten
-Last-Layer-Parameter auf den skalaren Netzausgang übertragen.
-
-Da die Hidden Layers nach dem Training als fest betrachtet werden, hängt
-$c$ innerhalb der Last-Layer-Laplace-Approximation für ein festes $x$ nur noch von den
-Last-Layer-Parametern $\theta_c$ des Konzentrationsnetzes ab. Deren
-Unsicherheit darf dennoch nicht unabhängig vom Quellennetz bestimmt werden:
-Beide Parametersätze wurden gemeinsam trainiert und sind insbesondere über
-den Advektions-Diffusions-Loss gekoppelt. Deshalb wird zunächst ihre
-gemeinsame Laplace-Kovarianz betrachtet und anschließend der für die
-Konzentration relevante Block entnommen.
-
-Die Last-Layer-Parameter beider Netze werden dazu zu einem gemeinsamen Vektor
-
-$$
+\theta_c=
+\begin{bmatrix}w_c\\b_c\end{bmatrix},
+\qquad
+\theta_q=
+\begin{bmatrix}w_q\\b_q\end{bmatrix},
+\qquad
 \theta=
-\begin{bmatrix}
-\theta_c\\
-\theta_q
-\end{bmatrix}
+\begin{bmatrix}\theta_c\\\theta_q\end{bmatrix}.
 $$
 
-zusammengefasst. Am trainierten Optimum $\theta^\ast$ wird die Hesse-Matrix
-des gemeinsamen Losses $L$ bezüglich dieser Parameter berechnet. Die
-Laplace-Approximation liefert die gemeinsame Kovarianzmatrix
+Hier sind $w_c\in\mathbb R^{m_c}$ und $w_q\in\mathbb R^{m_q}$ die
+Gewichtsvektoren sowie $b_c,b_q\in\mathbb R$ die Biases.
+
+**Wir müssen beide Parametersätze gemeinsam betrachten, weil wir für das
+Auswahlkriterium ihre Kopplung benötigen.** Zwei getrennte, unabhängige
+Approximationen würden die gesuchte Kreuzkovarianz nicht erfassen.
+
+### Wie erhalten wir die Parameterkovarianz?
+
+Sei $L(\theta)$ der gemeinsame Loss bei festgehaltenen Hidden Layers.
+Wir nehmen an, dass er bis auf eine additive Konstante einem negativen
+Log-Posterior entspricht. Seine Skalierung und Gewichtung legen damit
+auch die angenommene Unsicherheit fest.
+
+In der Nähe des trainierten Optimums $\theta^\ast$ mit
+$\nabla_\theta L(\theta^\ast)\approx0$ gilt
 
 $$
-\Sigma
-=
-\left(
-\nabla_\theta^2 L(\theta^\ast)+\lambda I
-\right)^{-1}
-=
-\begin{bmatrix}
-\Sigma_{cc} & \Sigma_{cq}\\
-\Sigma_{qc} & \Sigma_{qq}
-\end{bmatrix}.
-$$
-
-Der kleine Regularisierungsterm $\lambda I$ stabilisiert die Inversion. Der
-Block $\Sigma_{cc}$ beschreibt die Kovarianz der Last-Layer-Parameter des
-Konzentrationsnetzes.
-
-Für die feste Featureabbildung $h_c(x)$ definieren wir den um den Bias-Eintrag
-erweiterten Featurevektor
-
-$$
-\widetilde h_c(x)
-=
-\begin{bmatrix}
-h_c(x)\\
-1
-\end{bmatrix}.
-$$
-
-Der Ausgang des letzten linearen Layers vor $softplus(\cdot)$ ist damit
-
-$$
-z_c(x)=\theta_c^\top\widetilde h_c(x),
-$$
-
-und die Konzentrationsprognose lautet
-
-$$
-c(x)=\operatorname{softplus}(z_c(x)).
-$$
-
-Um die Parameterunsicherheit auf die Konzentrationsprognose zu übertragen,
-wird $c(x)$ bezüglich $\theta_c$ am Optimum linearisiert:
-
-$$
-\delta c(x)
+L(\theta)
 \approx
-\nabla_{\theta_c}c(x)^\top\delta\theta_c.
+L(\theta^\ast)
++
+\frac12(\theta-\theta^\ast)^\top
+H(\theta-\theta^\ast),
+\qquad
+H=\nabla_\theta^2L(\theta^\ast).
 $$
 
-Aus $\operatorname{Cov}[\delta\theta_c]=\Sigma_{cc}$ folgt mit der
-Varianz einer linearen Transformation
+Diese quadratische Näherung liefert bei positiv definitem $H$ die
+gaußsche Parameterapproximation
+
+$$
+\theta\sim\mathcal N(\theta^\ast,\Sigma),
+\qquad
+\Sigma=H^{-1}.
+$$
+
+Die gemeinsame Kovarianz hat die Blockstruktur
+
+$$
+\Sigma=
+\begin{bmatrix}
+\Sigma_{cc}&\Sigma_{cq}\\
+\Sigma_{qc}&\Sigma_{qq}
+\end{bmatrix},
+\qquad
+\Sigma_{cq}=\Sigma_{qc}^\top.
+$$
+
+Für unser Auswahlkriterium benötigen wir insbesondere
+$\Sigma_{cc}$, die Kovarianz der Konzentrationsparameter, und
+$\Sigma_{qc}$, die Kreuzkovarianz zwischen Quellen- und
+Konzentrationsparametern.
+
+> **Numerische Stabilisierung**
+>
+> In der Umsetzung symmetrisieren wir die berechnete Hesse-Matrix:
+>
+> $$
+> H_s=\frac12(H+H^\top)
+> =U\operatorname{diag}(\lambda_i)U^\top.
+> $$
+>
+> Dabei sind $\lambda_i$ die Eigenwerte und die Spalten von $U$
+> orthonormale Eigenvektoren. Mit $\varepsilon=10^{-7}$ verwenden wir
+>
+> $$
+> \Sigma=
+> U\operatorname{diag}\!\left(
+> \frac1{\max(\lambda_i,\varepsilon)}
+> \right)U^\top.
+> $$
+>
+> $\Sigma$ ist damit die Inverse einer positiv definiten Ersatzmatrix.
+> Werden Eigenwerte begrenzt, verändert dies die Approximation;
+> insbesondere sind deutlich negative Eigenwerte kein reines
+> Rundungsproblem.
+
+## Konzentrationsvarianz am Messkandidaten
+
+Für den Nenner des Auswahlkriteriums benötigen wir
+$\operatorname{Var}[c(x)]$. Dazu übertragen wir die Parameterkovarianz
+$\Sigma_{cc}$ auf den Netzausgang am Ort $x$.
+
+Die trainierte Vorhersage $c(x;\theta_c^\ast)$ ist fest. Die unsichere
+Vorhersage $c(x)=c(x;\theta_c)$ entsteht durch die approximierte
+Parameterverteilung. Mit
+
+$$
+\delta\theta_c=\theta_c-\theta_c^\ast,
+\qquad
+g_c(x)=
+\left.
+\nabla_{\theta_c}c(x;\theta_c)
+\right|_{\theta_c=\theta_c^\ast}
+$$
+
+linearisieren wir den Ausgang:
+
+$$
+c(x)
+\approx
+c(x;\theta_c^\ast)+g_c(x)^\top\delta\theta_c.
+$$
+
+Da der erste Term konstant ist, folgt unmittelbar
 
 $$
 \boxed{
 \operatorname{Var}[c(x)]
 \approx
-\nabla_{\theta_c}c(x)^\top
-\Sigma_{cc}
-\nabla_{\theta_c}c(x).
+g_c(x)^\top\Sigma_{cc}g_c(x).
 }
 $$
 
-Der benötigte Gradient kann für den letzten Layer direkt berechnet werden.
-Mit
+Zur Berechnung von $g_c(x)$ schreiben wir den Netzausgang als
 
 $$
-z_c^\ast(x)
+c(x;\theta_c)
 =
+\operatorname{softplus}\!\left(
+\theta_c^\top\widetilde h_c(x)
+\right),
+\qquad
+\widetilde h_c(x)=
+\begin{bmatrix}h_c(x)\\1\end{bmatrix}.
+$$
+
+Die angehängte Eins berücksichtigt den Bias.
+Mit $\operatorname{softplus}(z)=\log(1+e^z)$ und ihrer Ableitung
+$\operatorname{sigmoid}(z)=1/(1+e^{-z})$ ergibt die Kettenregel
+
+$$
+g_c(x)
+=
+\operatorname{sigmoid}\!\left(
 (\theta_c^\ast)^\top\widetilde h_c(x)
+\right)\widetilde h_c(x).
 $$
 
-und $\frac{d}{dz}\operatorname{softplus}(z)=\operatorname{sigmoid}(z)$ gilt
+Damit ist die benötigte Konzentrationsvarianz berechenbar.
+
+## Kopplung zwischen Quellenstärke und Konzentration
+
+Für den Zähler fehlt noch $\operatorname{Cov}[q(r),c(x)]$. Dazu
+linearisieren wir auch den Ausgang des Quellennetzes:
 
 $$
-\nabla_{\theta_c}c(x)
-=
-\operatorname{sigmoid}(z_c^\ast(x))\widetilde h_c(x).
-$$
-
-
-## Bestimmung der Kopplung von Last-Layer-Quellenparametern und der Konzentration
-
-Zudem wird
-$\operatorname{Cov}[\theta_q,c(x)]$ benötigt. Sie beschreibt, wie stark die
-Unsicherheit der Konzentrationsprognose an $x$ mit der Unsicherheit der
-Last-Layer-Quellenparameter zusammenhängt.
-
-Aus der gemeinsamen Laplace-Kovarianz gilt für die Abweichungen vom
-trainierten Optimum
-
-$$
-\operatorname{Cov}[\delta\theta_q,\delta\theta_c]
-=
-\Sigma_{qc}.
-$$
-
-Mit der bereits verwendeten Linearisierung
-
-$$
-\delta c(x)
+q(r)
 \approx
-\nabla_{\theta_c}c(x)^\top\delta\theta_c
+q(r;\theta_q^\ast)+g_q(r)^\top\delta\theta_q,
+\qquad
+\delta\theta_q=\theta_q-\theta_q^\ast.
 $$
 
-folgt aufgrund der linearen Transformation der Kovarianz
+Das Quellennetz verwendet ebenfalls einen Softplus-Ausgang. Daher gilt
+analog zur Konzentration
 
 $$
-\begin{aligned}
-\operatorname{Cov}[\theta_q,c(x)]
-&=
-\operatorname{Cov}[\delta\theta_q,\delta c(x)]\\
-&\approx
-\operatorname{Cov}\!\left[
-\delta\theta_q,
-\nabla_{\theta_c}c(x)^\top\delta\theta_c
-\right]\\
-&=
-\Sigma_{qc}\nabla_{\theta_c}c(x).
-\end{aligned}
+\widetilde h_q(r)=
+\begin{bmatrix}h_q(r)\\1\end{bmatrix},
+\qquad
+g_q(r)=
+\left.
+\nabla_{\theta_q}q(r;\theta_q)
+\right|_{\theta_q=\theta_q^\ast}
+=
+\operatorname{sigmoid}\!\left(
+(\theta_q^\ast)^\top\widetilde h_q(r)
+\right)\widetilde h_q(r).
 $$
 
-Damit ist
+Aus der gemeinsamen Parameterapproximation kennen wir bereits
+
+$$
+\operatorname{Cov}[\delta\theta_q,\delta\theta_c]=\Sigma_{qc}.
+$$
+
+Mit den beiden Linearisierungen folgt deshalb
 
 $$
 \boxed{
-\operatorname{Cov}[\theta_q,c(x)]
+\operatorname{Cov}[q(r),c(x)]
 \approx
-\Sigma_{qc}\nabla_{\theta_c}c(x)
-}.
+g_q(r)^\top\Sigma_{qc}g_c(x).
+}
 $$
 
-Die Ortsabhängigkeit entsteht durch den Konzentrationsgradienten bezüglich
-der Last-Layer-Parameter. Der Block $\Sigma_{qc}$ überträgt diese
-ortsabhängige Sensitivität auf die Quellenparameter. Mit
+Die Gradienten übertragen die Parameterkopplung auf die konkreten
+Orte $r$ und $x$.
+
+Zugleich begründen die Linearisierungen die eingangs verwendete
+Gaußapproximation: Die linearisierten Felder sind gemeinsam
+gaußverteilt, weil sie affine Funktionen der gemeinsam gaußverteilten
+Parameter sind. Für die ursprünglichen nichtlinearen Softplus-Ausgänge
+gilt dies nur näherungsweise.
+
+## Berechnung des nächsten Messpunkts
+
+Nun sind beide Größen des Auswahlkriteriums bekannt. Einsetzen ergibt
 
 $$
-\nabla_{\theta_c}c(x)
-=
-\operatorname{sigmoid}(z_c^\ast(x))\widetilde h_c(x)
-$$
-
-kann auch diese Größe unmittelbar aus der gemeinsamen Laplace-Kovarianz und
-den Konzentrationsfeatures berechnet werden.
-
-Einsetzen beider hergeleiteten Größen in das Auswahlkriterium ergibt den
-Score
-
-$$
+\boxed{
 s(x)
 =
 \frac{
-\left\|\Sigma_{qc}\nabla_{\theta_c}c(x)\right\|_2^2
+\frac1M\sum_{j=1}^{M}
+\left[
+g_q(r_j)^\top\Sigma_{qc}g_c(x)
+\right]^2
 }{
-\nabla_{\theta_c}c(x)^\top
-\Sigma_{cc}
-\nabla_{\theta_c}c(x)
+g_c(x)^\top\Sigma_{cc}g_c(x)
++\sigma_{\mathrm{obs}}^2
 },
-$$
-
-und damit
-
-$$
-\boxed{
-x_{\mathrm{next}}=\arg\max_x s(x)
-}.
-$$
-
-
-## Zusammenfassung
-
-Nach dem gemeinsamen Training von Konzentrationsnetz $c$ und Quellennetz $q$
-wird der nächste Messpunkt anhand der erwarteten Reduktion der
-Last-Layer-Quellenparameterunsicherheit gewählt. Für eine rauschfreie
-Konzentrationsmessung gilt in der linearisierten Laplace-Approximation:
-
-$$
-\boxed{
-s(x)=
-\frac{\left\|\Sigma_{qc}\nabla_{\theta_c}c\right\|_2^2}
-{\nabla_{\theta_c}c^\top\Sigma_{cc}\nabla_{\theta_c}c},
 \qquad
-x_{\mathrm{next}}=\arg\max_x s(x).
+x_{\mathrm{next}}
+\in
+\arg\max_{x\in\mathcal X}s(x).
 }
 $$
 
-1. **Gemeinsame Kovarianz einmal pro trainiertem Modell berechnen.**
-   Hidden Layers und Wind festhalten; die letzten Gewichte und Biases in der
-   Reihenfolge $\theta=(w_c,b_c,w_q,b_q)^\top$ zusammenfügen. Den gemeinsamen
-   Loss $L(\theta)$ auf festen Mess-, Rand- und Collocation-Punkten auswerten
-   und zweimal nach diesem Vektor ableiten:
+Praktisch bedeutet dies:
 
-   $$
-   H=\left.\nabla_\theta^2L(\theta)\right|_{\theta=\theta^\ast},
-   \qquad
-   \Sigma=(H+\lambda I)^{-1}.
-   $$
+1. Die Hidden Layers und den Wind festhalten und aus dem gemeinsamen
+   Loss die stabilisierte Last-Layer-Kovarianz $\Sigma$ berechnen.
+2. Die Gradienten $g_q(r_j)$ an den festen Auswertungspunkten und
+   $g_c(x)$ an den Messkandidaten bestimmen.
+3. $s(x)$ auswerten und einen erreichbaren Kandidaten mit maximalem
+   Wert auswählen.
 
-2. **Gradienten für jeden Kandidatenpunkt $x$ berechnen.**
-   Das Konzentrationsnetz bis zum letzten Hidden Layer auswerten und die 
-   trainierten letzten Gewichte und den Bias verwenden:
+Der rauschfreie Spezialfall ergibt sich mit
+$\sigma_{\mathrm{obs}}^2=0$, sofern der Nenner positiv ist.
 
-   $$
-   \widetilde h_c(x)=\begin{bmatrix}h_c(x)\\1\end{bmatrix},
-   \qquad
-   z_c^\ast(x)=(\theta_c^\ast)^\top\widetilde h_c(x),
-   \qquad
-   \nabla_{\theta_c}c=
-   \operatorname{sigmoid}(z_c^\ast(x))\widetilde h_c(x).
-   $$
-
-3. **Score auswerten und maximieren.**
-   Gradient und Kovarianzblöcke aus den vorherigen Schritten nutzen um $s(x)$ zu berechnen
-   und den erreichbaren
-   Kandidaten mit dem größten Score wählen. Die Formel setzt einen positiven
-   Nenner voraus; bei exakt null Konzentrationsvarianz ist auch die
-   Kreuzkovarianz null und es gibt in dieser Approximation keinen
-   Informationsgewinn.
+Der Auswahlwert beschreibt die prognostizierte Verringerung der
+mittleren Quellenvarianz an den Auswertungspunkten im aktuellen
+linearisierten Modell. Er erfasst nur die Last-Layer-Unsicherheit und
+garantiert nicht dieselbe Varianzreduktion nach erneutem Training des
+gesamten PINN.

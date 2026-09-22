@@ -55,15 +55,32 @@ class JointSourceLaplace:
         pre_softplus_output = augmented_input @ concentration_params
         return augmented_input * torch.sigmoid(pre_softplus_output)[:, None]
 
-    def source_uncertainty_reduction(self, xy: Tensor) -> Tensor:
-        """Score concentration measurements with wind treated as known and fixed."""
+    def source_gradient_wrt_parameters(self, xy: Tensor) -> Tensor:
+        """Return one source-parameter gradient per point: (N, n_q)."""
+        last_layer_input = self.q_net.last_hidden_features(xy)
+        augmented_input = torch.cat(
+            (last_layer_input, torch.ones_like(last_layer_input[:, :1])), dim=1
+        )
+        source_params = self.linear_layer_parameters(self.q_net.net[-1])
+        pre_softplus_output = augmented_input @ source_params
+        return augmented_input * torch.sigmoid(pre_softplus_output)[:, None]
+
+    def source_uncertainty_reduction(
+        self, xy: Tensor, source_eval_points: Tensor
+    ) -> Tensor:
+        """Mean source-field variance reduction for each candidate measurement."""
+        if source_eval_points.ndim != 2 or len(source_eval_points) == 0:
+            raise ValueError("source_eval_points must have shape (M, 2) with M > 0")
         if self.covariance is None:
             self.compute_covariance()
 
         cov_cc, _, cov_qc = self.split_covariance(self.covariance)
         grad_c = self.concentration_gradient_wrt_parameters(xy).T.to(cov_cc.dtype)
-        numerator = torch.sum((cov_qc @ grad_c)**2, dim=0)
-        denominator = (grad_c.T @ cov_cc @ grad_c).diagonal()
+        grad_q = self.source_gradient_wrt_parameters(source_eval_points).to(cov_cc.dtype)
+        source_gram = (grad_q.T @ grad_q) / len(source_eval_points)
+        coupled = cov_qc @ grad_c
+        numerator = torch.sum(coupled * (source_gram @ coupled), dim=0)
+        denominator = torch.sum(grad_c * (cov_cc @ grad_c), dim=0)
         return numerator / (denominator + 1e-8)
 
     @staticmethod
