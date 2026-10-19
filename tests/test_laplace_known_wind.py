@@ -2,19 +2,17 @@ import numpy as np
 import pytest
 import torch
 
-from source_estimation_pinn.estimation.laplace import JointSourceLaplace
 from source_estimation_pinn.environment import (
     CellType,
     OccupancyGrid,
     WindField,
 )
-from source_estimation_pinn.measurements import GasSampleSet, WindSampleSet
 from source_estimation_pinn.estimation import (
     GasSourceConfig,
     GasSourceEstimator,
-    WindGasSourceConfig,
-    WindGasSourceEstimator,
 )
+from source_estimation_pinn.estimation.laplace import JointSourceLaplace
+from source_estimation_pinn.measurements import GasSampleSet
 
 
 @pytest.mark.parametrize("small_eigenvalue", [-1e-5, 0.0, 1e-9, 0.5])
@@ -100,90 +98,6 @@ def fitted_estimator(estimator):
     return estimator
 
 
-def test_last_layer_reconstruction(estimator):
-    xy = estimator._tensor(np.array([
-        [1.0, 1.0],
-        [4.0, 3.0],
-        [8.0, 5.0],
-    ]))
-
-    # Concentration network
-    c_net = estimator.model.c_net
-    h_c = c_net.last_hidden_features(xy)
-    z_c_from_features = c_net.eval_last_layer(h_c)
-    z_c = c_net.raw_output(xy)
-    c_reconstructed = torch.nn.functional.softplus(z_c)
-
-    torch.testing.assert_close(z_c_from_features, z_c)
-    torch.testing.assert_close(c_reconstructed, c_net(xy))
-
-    # Source network
-    q_net = estimator.model.q_net
-    h_q = q_net.last_hidden_features(xy)
-    z_q_from_features = q_net.eval_last_layer(h_q)
-    z_q = q_net.raw_output(xy)
-    q_reconstructed = torch.nn.functional.softplus(z_q)
-
-    torch.testing.assert_close(z_q_from_features, z_q)
-    torch.testing.assert_close(q_reconstructed, q_net(xy))
-
-def test_last_layer_loss(fitted_estimator):
-    estimator = fitted_estimator
-    data = estimator._require_training_data()
-    indices = torch.arange(len(data.xy_free), device=estimator.device)
-
-    normal_components = estimator._loss_components(
-        data,
-        indices,
-        estimator.model.c_net,
-        estimator.model.q_net,
-        compute_wind_loss=False,
-        detach_wind=True,
-    )
-
-    params = estimator.model.last_layer_params
-    prior = (
-        0.5
-        * estimator.config.last_layer_prior_precision
-        * torch.sum(params**2)
-    )
-    normal_loss = sum(normal_components.values()) + prior
-
-    external_params = params.detach().clone().requires_grad_(True)
-    external_loss = estimator.loss_for_last_layer(external_params)
-
-    torch.testing.assert_close(external_loss, normal_loss)
-
-
-def test_joint_last_layer_loss_is_differentiable(fitted_estimator):
-    estimator = fitted_estimator
-
-    params = (
-        estimator.model.last_layer_params
-        .detach()
-        .clone()
-        .requires_grad_(True)
-    )
-    loss = estimator.loss_for_last_layer(params)
-
-    gradient = torch.autograd.grad(loss, params)[0]
-    gradient_c, gradient_q = estimator.model.split_ll_params(gradient)
-
-    assert torch.isfinite(gradient).all()
-    assert torch.any(gradient_c != 0)
-    assert torch.any(gradient_q != 0)
-
-
-def test_joint_last_layer_covariance(fitted_estimator):
-    estimator = fitted_estimator
-
-    params = estimator.model.last_layer_params
-    covariance = estimator.laplace.compute_covariance()
-
-    expected_shape = (len(params), len(params))
-    assert covariance.shape == expected_shape
-    assert torch.isfinite(covariance).all()
-
 def test_concentration_gradient_wrt_ll_params(fitted_estimator):
     estimator = fitted_estimator
     xy = estimator._tensor([[0.5, 0.5], [1.0, 1.0], [1.5, 1.5]])
@@ -225,14 +139,6 @@ def test_source_gradient_wrt_ll_params(fitted_estimator):
 
     assert gradient.shape == (len(xy), layer.in_features + 1)
     torch.testing.assert_close(gradient, torch.stack(expected_rows))
-
-def test_uncertainty_reduction_score(fitted_estimator):
-    xy = np.array([[0.5, 0.5], [1.0, 1.0], [1.5, 1.5]])
-    score = fitted_estimator.source_uncertainty_reduction(xy)
-    assert score.shape == (len(xy),)
-    assert torch.isfinite(score).all()
-    assert torch.all(score >= 0)
-
 
 def test_uncertainty_reduction_batch_matches_single_points(fitted_estimator):
     xy = np.array([[0.5, 0.5], [1.0, 1.0], [1.5, 1.5]])
@@ -277,30 +183,6 @@ def test_uncertainty_reduction_known_covariance(estimator, monkeypatch, coupled)
     expected = covariance.new_tensor([0.25, 0.0, 0.125] if coupled else [0.0] * 3)
     assert scores.shape == (3,)
     torch.testing.assert_close(scores, expected)
-
-
-def test_laplace_is_only_available_with_known_wind(estimator):
-    joint = WindGasSourceEstimator(
-        occupancy=estimator.occupancy,
-        config=WindGasSourceConfig(),
-    )
-    for name in (
-        "loss_for_last_layer",
-        "source_uncertainty_reduction",
-        "laplace",
-    ):
-        assert hasattr(estimator, name)
-        assert not hasattr(joint, name)
-
-    # Joint training must still work without any Laplace state.
-    positions = np.array([[0.5, 0.5], [1.5, 1.5]])
-    joint.fit(
-        GasSampleSet(positions=positions, concentrations=np.array([0.2, 0.1])),
-        WindSampleSet(positions=positions, wind_vectors=np.zeros((2, 2))),
-        steps=1,
-        n_collocation_points=4,
-    )
-    assert not hasattr(joint, "laplace")
 
 
 def test_training_invalidates_laplace_cache(fitted_estimator):

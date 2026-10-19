@@ -1,12 +1,16 @@
+import re
+from enum import IntEnum
 from pathlib import Path
-from matplotlib import pyplot, colors
-from matplotlib.patches import Patch
-from meshio import Mesh, read
+
 import numpy as np
 import pandas as pd
-import re
+import yaml
+from matplotlib import colors, pyplot
+from matplotlib.patches import Patch
+from meshio import Mesh, read
+from PIL import Image
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
-from enum import IntEnum
+
 
 class CellType(IntEnum):
     """Cell types for occupancy grid."""
@@ -307,7 +311,7 @@ class OccupancyGrid:
 
             for segment, physical_ID in zip(line_segments_block, physical_IDs_block):
                 physical_name = OccupancyGrid.physical_ID_to_name(mesh, physical_ID, 1)
-                pattern = re.compile(r"(wall|obstacle|solid|no_?slip)", re.I)
+                pattern = re.compile(r"(wall|obstacle|solid|no_?slip)", re.IGNORECASE)
 
                 if pattern.match(physical_name):
                     continue
@@ -334,6 +338,57 @@ class OccupancyGrid:
             occupancy=occupancy_grid,
             resolution=resolution,
             origin=np.array([x_min, y_min]),
+        )
+
+    @classmethod
+    def from_occupancy_file(cls, path: str | Path) -> "OccupancyGrid":
+        """Load a ROS-style YAML occupancy map and its referenced image."""
+        path = Path(path)
+        metadata = yaml.safe_load(path.read_text())
+        required_keys = {
+            "image",
+            "resolution",
+            "origin",
+            "occupied_thresh",
+            "free_thresh",
+        }
+        missing_keys = required_keys.difference(metadata)
+        if missing_keys:
+            raise ValueError(
+                "Occupancy YAML is missing keys: "
+                + ", ".join(sorted(missing_keys))
+            )
+
+        origin = np.asarray(metadata["origin"], dtype=float)
+        if origin.shape not in {(2,), (3,)}:
+            raise ValueError("Occupancy YAML origin must have two or three values")
+
+        image_path = path.parent / metadata["image"]
+        image = np.asarray(Image.open(image_path).convert("L"), dtype=float) / 255.0
+        if bool(metadata.get("negate", 0)):
+            image = 1.0 - image
+
+        occupied = image <= 1.0 - float(metadata["occupied_thresh"])
+        free = image >= 1.0 - float(metadata["free_thresh"])
+        occupancy = np.full(image.shape, CellType.OCCUPIED, dtype=np.uint8)
+        occupancy[free] = CellType.FREE
+        occupancy[occupied] = CellType.OCCUPIED
+        occupancy = np.flipud(occupancy)
+
+        # Free cells on the outside edge of an occupancy map are exits from
+        # the represented domain. Keep the same boundary semantics as the MSH
+        # loader, which marks non-wall physical boundary segments as open.
+        free_edge = np.zeros_like(occupancy, dtype=bool)
+        free_edge[0, :] = occupancy[0, :] == CellType.FREE
+        free_edge[-1, :] = occupancy[-1, :] == CellType.FREE
+        free_edge[:, 0] |= occupancy[:, 0] == CellType.FREE
+        free_edge[:, -1] |= occupancy[:, -1] == CellType.FREE
+        occupancy[free_edge] = CellType.OPEN_BOUNDARY
+
+        return cls(
+            occupancy=occupancy,
+            resolution=float(metadata["resolution"]),
+            origin=origin[:2],
         )
 
     def cell_type_at(self, position: np.ndarray) -> CellType | np.ndarray:

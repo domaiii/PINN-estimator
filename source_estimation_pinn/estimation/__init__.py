@@ -20,6 +20,7 @@ from .networks import (
     VelocityNet2D,
     WindNet2D,
 )
+from .uncertainty_based_gas_source_estimator import UncertaintyBasedGasSourceEstimator
 from .wind_estimator import WindEstimator
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "StreamFunctionNet2D",
     "StreamFunctionWindConfig",
     "StreamFunctionWindLoss",
+    "UncertaintyBasedGasSourceEstimator",
     "VelocityNet2D",
     "WindConfig",
     "WindDistributionLoss",

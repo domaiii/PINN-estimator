@@ -1,12 +1,9 @@
 # %%
-from pathlib import Path
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
-from matplotlib.colors import LogNorm
 
 import numpy as np
 import pandas as pd
@@ -18,7 +15,8 @@ from mpi4py import MPI
 from petsc4py import PETSc
 from scipy.spatial import cKDTree
 
-from data.visualizer import Visualizer
+from dispersion_physics.visualizer import Visualizer
+
 
 def _read_physical_name_map(
     meshfile: str | Path, dim: int | None = None

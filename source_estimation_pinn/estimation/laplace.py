@@ -27,10 +27,12 @@ class JointSourceLaplace:
         self.covariance = None
 
     def compute_covariance(self) -> Tensor:
-        parameters = torch.cat([
-            self.linear_layer_parameters(self.c_net.net[-1]),
-            self.linear_layer_parameters(self.q_net.net[-1]),
-        ]).detach()
+        parameters = torch.cat(
+            [
+                self.linear_layer_parameters(self.c_net.net[-1]),
+                self.linear_layer_parameters(self.q_net.net[-1]),
+            ]
+        ).detach()
         self.covariance = self.covariance_from_loss(
             self.loss_function, parameters
         ).detach()
@@ -76,7 +78,9 @@ class JointSourceLaplace:
 
         cov_cc, _, cov_qc = self.split_covariance(self.covariance)
         grad_c = self.concentration_gradient_wrt_parameters(xy).T.to(cov_cc.dtype)
-        grad_q = self.source_gradient_wrt_parameters(source_eval_points).to(cov_cc.dtype)
+        grad_q = self.source_gradient_wrt_parameters(source_eval_points).to(
+            cov_cc.dtype
+        )
         source_gram = (grad_q.T @ grad_q) / len(source_eval_points)
         coupled = cov_qc @ grad_c
         numerator = torch.sum(coupled * (source_gram @ coupled), dim=0)
@@ -89,7 +93,6 @@ class JointSourceLaplace:
         if layer.bias is None:
             raise ValueError("The linear layer must have a bias")
         return torch.cat((layer.weight.reshape(-1), layer.bias.reshape(-1)))
-
 
     @staticmethod
     def covariance_from_loss(

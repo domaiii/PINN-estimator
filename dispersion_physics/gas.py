@@ -116,25 +116,37 @@ class GasDispersion:
         velocity = self.wind_field.velocity_at(self.positions)
         velocity += np.random.normal(scale=self.diffusion_speed_std, size=velocity.shape)
         proposed_position_changes = velocity * dt
+        max_substep = self.occupancy.resolution / 2.0
+        largest_step = np.linalg.norm(proposed_position_changes, axis=1).max()
+        n_substeps = max(1, int(np.ceil(largest_step / max_substep)))
+        substep_changes = proposed_position_changes / n_substeps
+        alive = np.ones(len(self.positions), dtype=bool)
 
-        new_states = self.occupancy.cell_type_at(
-            self.positions + proposed_position_changes
-        )
+        # Check the whole trajectory, not only its endpoint. Fast wind can move
+        # a filament across an open-boundary cell in one simulation step.
+        for _ in range(n_substeps):
+            indices = np.flatnonzero(alive)
+            current_positions = self.positions[indices]
+            changes = substep_changes[indices]
+            new_positions = current_positions + changes
+            new_states = self.occupancy.cell_type_at(new_positions)
 
-        free_mask = new_states == CellType.FREE
-        occupied_mask = new_states == CellType.OCCUPIED
-        open_boundary_mask = new_states == CellType.OPEN_BOUNDARY
+            open_mask = new_states == CellType.OPEN_BOUNDARY
+            alive[indices[open_mask]] = False
 
-        self.positions[free_mask] += proposed_position_changes[free_mask]
-        self.positions[occupied_mask] = self.adjust_wall_filaments(
-            self.positions[occupied_mask], proposed_position_changes[occupied_mask]
-        )
+            free_mask = new_states == CellType.FREE
+            self.positions[indices[free_mask]] = new_positions[free_mask]
+            self.ages[indices[free_mask]] += dt
+            occupied_mask = new_states == CellType.OCCUPIED
+            if np.any(occupied_mask):
+                occupied_indices = indices[occupied_mask]
+                self.positions[occupied_indices] = self.adjust_wall_filaments(
+                    self.positions[occupied_indices], changes[occupied_mask]
+                )
 
-        self.positions = self.positions[np.logical_not(open_boundary_mask)]
-        self.ages = self.ages[np.logical_not(open_boundary_mask)]
-        self.masses = self.masses[np.logical_not(open_boundary_mask)]
-        
-        self.ages += dt
+        self.positions = self.positions[alive]
+        self.ages = self.ages[alive] + dt
+        self.masses = self.masses[alive]
 
     def kill_filaments(self) -> None:
         keep = self.ages <= self.max_age
@@ -164,8 +176,32 @@ class GasDispersion:
             / (2.0 * np.pi * sigma_squared[None, :])
             * np.exp(-distance_squared / (2.0 * sigma_squared[None, :]))
         )
+
+        for query_index, query_point in enumerate(query):
+            visible = self._filaments_visible_from(query_point)
+            contributions[query_index, ~visible] = 0.0
+
         result = contributions.sum(axis=1)
         return float(result[0]) if single_point else result
+
+    def _filaments_visible_from(self, query_point: np.ndarray) -> np.ndarray:
+        """Return whether occupied cells block each filament's contribution."""
+        displacement = self.positions - query_point
+        distances = np.linalg.norm(displacement, axis=1)
+        sample_spacing = self.occupancy.resolution / 2.0
+        sample_counts = np.maximum(
+            1,
+            np.ceil(distances / sample_spacing).astype(int),
+        )
+        max_samples = sample_counts.max()
+
+        fractions = np.arange(max_samples + 1)[None, :] / sample_counts[:, None]
+        fractions = np.minimum(fractions, 1.0)
+        samples = query_point + displacement[:, None, :] * fractions[:, :, None]
+
+        states = self.occupancy.cell_type_at(samples.reshape(-1, 2))
+        states = np.asarray(states).reshape(samples.shape[:-1])
+        return np.all(states != CellType.OCCUPIED, axis=1)
 
     def adjust_wall_filaments(
         self,

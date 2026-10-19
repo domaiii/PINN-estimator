@@ -15,28 +15,10 @@ from .configs import (
     WindConfig,
 )
 from .losses import StreamFunctionWindLoss, WindDistributionLoss
-from .networks import StreamFunctionNet2D, WindNet2D
+from .models import build_wind_network
 
 
-def _build_wind_network(
-    bounds: tuple[np.ndarray, np.ndarray],
-    config: WindConfig,
-) -> nn.Module:
-    lower_bound, upper_bound = bounds
-    network_class = (
-        StreamFunctionNet2D
-        if isinstance(config, StreamFunctionWindConfig)
-        else WindNet2D
-    )
-    return network_class(
-        lower_bound,
-        upper_bound,
-        hidden_layers=config.hidden_layers,
-        hidden_dim=config.hidden_dim,
-    )
-
-
-def _build_wind_loss(config: WindConfig) -> nn.Module:
+def build_wind_loss(config: WindConfig) -> nn.Module:
     if isinstance(config, StreamFunctionWindConfig):
         return StreamFunctionWindLoss(
             lambda_data=config.lambda_data,
@@ -54,7 +36,7 @@ def _build_wind_loss(config: WindConfig) -> nn.Module:
     )
 
 
-def _wind_loss_components(
+def wind_loss_components(
     config: WindConfig,
     network: nn.Module,
     loss: nn.Module,
@@ -105,8 +87,8 @@ class WindEstimator:
         self.config = config or NavierStokesWindConfig()
         self.device = torch.device(device)
         bounds = (occupancy.lower_bound, occupancy.upper_bound)
-        self.network = _build_wind_network(bounds, self.config).to(self.device)
-        self.loss = _build_wind_loss(self.config).to(self.device)
+        self.network = build_wind_network(bounds, self.config).to(self.device)
+        self.loss = build_wind_loss(self.config).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.network.parameters(),
             lr=self.config.learning_rate,
@@ -160,7 +142,7 @@ class WindEstimator:
                 device=self.device,
             )
             xy_collocation = xy_free[indices].detach().requires_grad_(True)
-            _, components = _wind_loss_components(
+            _, components = wind_loss_components(
                 self.config,
                 self.network,
                 self.loss,
@@ -208,7 +190,7 @@ class WindEstimator:
 
     def predict_pressure(self, xy: np.ndarray) -> np.ndarray:
         if isinstance(self.config, StreamFunctionWindConfig):
-            raise RuntimeError("The streamfunction formulation has no pressure field")
+            raise TypeError("The streamfunction formulation has no pressure field")
         points = np.asarray(xy, dtype=float)
         single_point = points.ndim == 1
         points = np.atleast_2d(points)

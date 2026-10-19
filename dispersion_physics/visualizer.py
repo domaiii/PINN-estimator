@@ -1,13 +1,14 @@
 import argparse
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import matplotlib.tri as mtri
-
-from scipy.spatial import cKDTree
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import matplotlib.tri as mtri
+import numpy as np
+import pandas as pd
 from basix.ufl import element
 from dolfinx import fem, mesh
+from scipy.spatial import cKDTree
+
 
 class Visualizer:
     """
@@ -156,7 +157,7 @@ class Visualizer:
         """
         bs = vector_func.function_space.dofmap.index_map_bs
         if bs < 2:
-            raise ValueError(f"Given field must be a vector field with at least 2 components.")
+            raise ValueError("Given field must be a vector field with at least 2 components.")
 
         # Regular plotting grid in domain bounding box
         x_min, y_min = np.min(self.points, axis=0)
@@ -222,7 +223,7 @@ class Visualizer:
             if colorbar_label is not None:
                 cbar.set_label(colorbar_label)
 
-        handles, labels = self.ax.get_legend_handles_labels()
+        _, labels = self.ax.get_legend_handles_labels()
         if labels:
             self.ax.legend(
                 loc="upper center",

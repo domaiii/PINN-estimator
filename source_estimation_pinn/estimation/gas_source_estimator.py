@@ -18,11 +18,10 @@ from .configs import (
 )
 from .laplace import JointSourceLaplace
 from .losses import AdvectionDiffusionState, GasDistributionLoss, GasSourceLoss
-from .networks import PositiveFieldNet
+from .models import GasSourceModel, WindGasSourceModel
 from .wind_estimator import (
-    _build_wind_loss,
-    _build_wind_network,
-    _wind_loss_components,
+    build_wind_loss,
+    wind_loss_components,
 )
 
 
@@ -37,56 +36,6 @@ class _TrainingData:
     xy_open: torch.Tensor
     open_normals: torch.Tensor
 
-
-class _GasSourceModel(nn.Module):
-    def __init__(self, bounds: tuple[np.ndarray, np.ndarray], config: GasSourceConfig):
-        super().__init__()
-        lower_bound, upper_bound = bounds
-        self.c_net = PositiveFieldNet(
-            lower_bound,
-            upper_bound,
-            hidden_layers=config.concentration_hidden_layers,
-            hidden_dim=config.concentration_hidden_dim,
-            initial_value=config.concentration_initial_value,
-        )
-        self.q_net = PositiveFieldNet(
-            lower_bound,
-            upper_bound,
-            hidden_layers=config.source_hidden_layers,
-            hidden_dim=config.source_hidden_dim,
-            initial_value=config.source_initial_value,
-        )
-
-    @property
-    def last_layer_params(self) -> torch.Tensor:
-        """Return the parameters of the last layers of both networks."""
-        return torch.cat([
-            JointSourceLaplace.linear_layer_parameters(self.c_net.net[-1]),
-            JointSourceLaplace.linear_layer_parameters(self.q_net.net[-1]),
-        ])
-
-    def split_ll_params(self, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Split a concatenated last-layer parameter vector into two parts."""
-        c_last_layer_size = self.c_net.net[-1].in_features + 1
-        q_last_layer_size = self.q_net.net[-1].in_features + 1
-        
-        if len(params) != c_last_layer_size + q_last_layer_size:
-            raise ValueError(
-                f"params must have length {c_last_layer_size + q_last_layer_size}"
-            )
-        return params[:c_last_layer_size], params[c_last_layer_size:]
-
-
-class _WindGasSourceModel(_GasSourceModel):
-    def __init__(
-        self,
-        bounds: tuple[np.ndarray, np.ndarray],
-        config: WindGasSourceConfig,
-    ):
-        super().__init__(bounds, config)
-        self.wind_net = _build_wind_network(bounds, config.wind)
-
-
 class _GasSourceEstimatorBase(ABC):
     """Shared training machinery for known- and estimated-wind variants."""
 
@@ -94,7 +43,7 @@ class _GasSourceEstimatorBase(ABC):
         self,
         occupancy: OccupancyGrid,
         config: GasSourceConfig,
-        model: _GasSourceModel,
+        model: GasSourceModel,
         optimizer: torch.optim.Optimizer,
     ):
         self.config = config
@@ -359,7 +308,7 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
         config = config or GasSourceConfig()
         device = torch.device(config.device)
         bounds = (occupancy.lower_bound, occupancy.upper_bound)
-        model = _GasSourceModel(bounds, config).to(device)
+        model = GasSourceModel(bounds, config).to(device)
         optimizer = torch.optim.Adam(
             model.parameters(), lr=config.learning_rate
         )
@@ -506,7 +455,7 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         config = config or WindGasSourceConfig()
         device = torch.device(config.device)
         bounds = (occupancy.lower_bound, occupancy.upper_bound)
-        model = _WindGasSourceModel(bounds, config).to(device)
+        model = WindGasSourceModel(bounds, config).to(device)
         gas_parameters = list(model.c_net.parameters()) + list(
             model.q_net.parameters()
         )
@@ -516,14 +465,14 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         ])
         super().__init__(occupancy, config, model, optimizer)
         self.config = config
-        self.wind_distribution_loss = _build_wind_loss(config.wind).to(
+        self.wind_distribution_loss = build_wind_loss(config.wind).to(
             self.device
         )
         self._xy_wind_measurements: torch.Tensor | None = None
         self._uv_measurements: torch.Tensor | None = None
 
     @property
-    def _joint_model(self) -> _WindGasSourceModel:
+    def _joint_model(self) -> WindGasSourceModel:
         return self.model  # type: ignore[return-value]
 
     def _wind_components(
@@ -539,7 +488,7 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         if not compute_loss:
             return self._joint_model.wind_net(xy_collocation)[:, :2], {}
 
-        return _wind_loss_components(
+        return wind_loss_components(
             self.config.wind,
             self._joint_model.wind_net,
             self.wind_distribution_loss,
@@ -587,7 +536,7 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
 
     def predict_pressure(self, xy: np.ndarray) -> np.ndarray:
         if isinstance(self.config.wind, StreamFunctionWindConfig):
-            raise RuntimeError("The streamfunction formulation has no pressure field")
+            raise TypeError("The streamfunction configured by a StreamFunctionWindConfig has no pressure field")
         values = self._predict(self._joint_model.wind_net, xy)
         return values[..., 2]
 
