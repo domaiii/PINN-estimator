@@ -3,5 +3,7 @@ matplotlib
 meshio
 numpy
 pandas
+Pillow
+PyYAML
 scipy
 torch
