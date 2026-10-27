@@ -14,6 +14,7 @@ class GasSourceConfig:
     concentration_initial_value: float = 1e-3
     source_initial_value: float = 1e-3
     diffusion_constant: float = 1e-3
+    dynamic_weights: bool = False
     lambda_gas_data: float = 1.0
     lambda_ad: float = 1.0
     lambda_gas_wall: float = 1.0
@@ -39,6 +40,19 @@ class GasSourceConfig:
             raise ValueError("last_layer_prior_precision must be non-negative")
         if self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be positive")
+
+        if self.lambda_gas_data < 0.0:
+            raise ValueError("lambda_gas_data must be non-negative")
+        if self.lambda_ad < 0.0:
+            raise ValueError("lambda_ad must be non-negative")
+        if self.lambda_gas_wall < 0.0:  
+            raise ValueError("lambda_gas_wall must be non-negative")
+        if self.lambda_inflow < 0.0:
+            raise ValueError("lambda_inflow must be non-negative")
+        if self.lambda_sparse < 0.0:
+            raise ValueError("lambda_sparse must be non-negative")
+        if self.lambda_nonfree < 0.0:
+            raise ValueError("lambda_nonfree must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -89,9 +103,10 @@ class WindGasSourceConfig(GasSourceConfig):
 
 @dataclass
 class EstimationHistory:
-    """Weighted loss values recorded during training."""
+    """Weighted loss values and weights recorded during training."""
 
     losses: dict[str, np.ndarray]
+    weights: dict[str, np.ndarray] = field(default_factory=dict)
 
     @property
     def total(self) -> np.ndarray:

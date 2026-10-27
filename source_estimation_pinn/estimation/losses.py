@@ -15,17 +15,9 @@ class AdvectionDiffusionState:
 class GasDistributionLoss(nn.Module):
     def __init__(
         self,
-        lambda_data: float = 1.0,
-        lambda_AD: float = 1.0,
-        lambda_wall: float = 1.0,
-        lambda_inflow: float = 1.0,
         diffusion_constant: float = 1e-3,
     ):
         super().__init__()
-        self.lambda_data = lambda_data
-        self.lambda_AD = lambda_AD
-        self.lambda_wall = lambda_wall
-        self.lambda_inflow = lambda_inflow
         self.diffusion_constant = diffusion_constant
 
     def components(
@@ -36,7 +28,7 @@ class GasDistributionLoss(nn.Module):
         dc_dn_walls: torch.Tensor | None = None,
         c_inflow: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        data_loss = self.lambda_data * torch.mean(
+        data_loss = torch.mean(
             (c_measurements - c_pred_at_measurements) ** 2
         )
 
@@ -67,15 +59,15 @@ class GasDistributionLoss(nn.Module):
             + AD_collocation.uv[:, 1] * c_y
             - AD_collocation.q
         )
-        ad_loss = self.lambda_AD * torch.mean(ad_residual**2)
+        ad_loss = torch.mean(ad_residual**2)
 
         wall_loss = AD_collocation.c.new_zeros(())
         if dc_dn_walls is not None and dc_dn_walls.numel() > 0:
-            wall_loss = self.lambda_wall * torch.mean(dc_dn_walls**2)
+            wall_loss = torch.mean(dc_dn_walls**2)
 
         inflow_loss = AD_collocation.c.new_zeros(())
         if c_inflow is not None and c_inflow.numel() > 0:
-            inflow_loss = self.lambda_inflow * torch.mean(c_inflow**2)
+            inflow_loss = torch.mean(c_inflow**2)
 
         return {
             "gas_data": data_loss,
@@ -335,25 +327,19 @@ class StreamFunctionWindLoss(nn.Module):
 
 
 class GasSourceLoss(nn.Module):
-    def __init__(
-        self,
-        lambda_nonfree: float = 1e-2,
-        lambda_sparse: float = 1e-3,
-    ):
+    def __init__(self):
         super().__init__()
-        self.lambda_nonfree = lambda_nonfree
-        self.lambda_sparse = lambda_sparse
 
     def components(
         self,
         q_free: torch.Tensor,
         q_nonfree: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        loss_sparse = self.lambda_sparse * torch.mean(q_free)
+        loss_sparse = torch.mean(q_free)
         if q_nonfree.numel() == 0:
             loss_nonfree = q_free.new_zeros(())
         else:
-            loss_nonfree = self.lambda_nonfree * torch.mean(q_nonfree**2)
+            loss_nonfree = torch.mean(q_nonfree**2)
         return {
             "sparse": loss_sparse,
             "nonfree": loss_nonfree,

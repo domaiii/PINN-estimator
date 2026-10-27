@@ -17,6 +17,7 @@ from .configs import (
     WindGasSourceConfig,
 )
 from .laplace import JointSourceLaplace
+from .loss_weighting import LearnedWeights, StaticWeights
 from .losses import AdvectionDiffusionState, GasDistributionLoss, GasSourceLoss
 from .models import GasSourceModel, WindGasSourceModel
 from .wind_estimator import (
@@ -36,6 +37,7 @@ class _TrainingData:
     xy_open: torch.Tensor
     open_normals: torch.Tensor
 
+
 class _GasSourceEstimatorBase(ABC):
     """Shared training machinery for known- and estimated-wind variants."""
 
@@ -52,16 +54,16 @@ class _GasSourceEstimatorBase(ABC):
         self.model = model.to(self.device)
         self.optimizer = optimizer
         self.gas_distribution_loss = GasDistributionLoss(
-            lambda_data=config.lambda_gas_data,
-            lambda_AD=config.lambda_ad,
-            lambda_wall=config.lambda_gas_wall,
-            lambda_inflow=config.lambda_inflow,
             diffusion_constant=config.diffusion_constant,
         ).to(self.device)
-        self.gas_source_loss = GasSourceLoss(
-            lambda_sparse=config.lambda_sparse,
-            lambda_nonfree=config.lambda_nonfree,
-        ).to(self.device)
+        self.gas_source_loss = GasSourceLoss().to(self.device)
+        if config.dynamic_weights:
+            self.loss_weights = LearnedWeights(config).to(self.device)
+            self.optimizer.add_param_group({
+                "params": self.loss_weights.parameters(),
+            })
+        else:
+            self.loss_weights = StaticWeights(config).to(self.device)
 
         self.history: EstimationHistory | None = None
         self._training_data: _TrainingData | None = None
@@ -86,9 +88,7 @@ class _GasSourceEstimatorBase(ABC):
             self.occupancy.y_centers,
         )
         nonfree_mask = ~self.occupancy.free_mask
-        nonfree_points = np.column_stack(
-            (xx[nonfree_mask], yy[nonfree_mask])
-        )
+        nonfree_points = np.column_stack((xx[nonfree_mask], yy[nonfree_mask]))
         wall_points, wall_normals = self.occupancy.wall_boundary_samples()
         open_points, open_normals = self.occupancy.open_boundary_samples()
 
@@ -125,6 +125,12 @@ class _GasSourceEstimatorBase(ABC):
         concentration: Callable[[torch.Tensor], torch.Tensor],
     ) -> torch.Tensor | None:
         """Return predicted concentration at the current inflow points."""
+
+    def _weighted_loss_components(self, components):
+        given = self.loss_weights()
+        one = torch.ones((), device=self.device)
+        weights = {k: given.get(k, one) for k in components}
+        return {k: weights[k] * v for k, v in components.items()}, weights
 
     def _gas_distribution_loss_components(
         self,
@@ -193,10 +199,7 @@ class _GasSourceEstimatorBase(ABC):
             ad_state,
         )
         components.update(
-            self.gas_source_loss.components(
-                q_collocation, 
-                source(data.xy_nonfree)
-            )
+            self.gas_source_loss.components(q_collocation, source(data.xy_nonfree))
         )
         components.update(wind_components)
 
@@ -205,7 +208,7 @@ class _GasSourceEstimatorBase(ABC):
     def loss_on_random_collocation(
         self,
         n_collocation_points: int,
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         data = self._require_training_data()
         if n_collocation_points <= 0:
             raise ValueError("n_collocation_points must be positive")
@@ -227,20 +230,34 @@ class _GasSourceEstimatorBase(ABC):
             * self.config.last_layer_prior_precision
             * torch.sum(params_last_layer**2)
         )
-        return {"total": sum(components.values()), **components}
+        weighted, weights = self._weighted_loss_components(components)
+        # Empty residual groups have no likelihood and hence no log-scale term.
+        active_components = {"gas_data", "ad"}
+        if len(data.xy_walls):
+            active_components.add("gas_wall")
+        if len(data.xy_nonfree):
+            active_components.add("nonfree")
+        with torch.no_grad():
+            inflow = self._inflow_concentration(data, self.model.c_net)
+        if inflow is not None and inflow.numel():
+            active_components.add("inflow")
+        loss = {
+            "total": sum(weighted.values()) + self.loss_weights.log_term(active_components),
+            **weighted
+        }
+        return loss, weights
 
     def training_step(
         self,
         n_collocation_points: int,
-    ) -> dict[str, float]:
+    ) -> tuple[dict[str, float], dict[str, float]]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
-        losses = self.loss_on_random_collocation(n_collocation_points)
+        losses, weights = self.loss_on_random_collocation(n_collocation_points)
         losses["total"].backward()
         self.optimizer.step()
-        return {
-            name: value.detach().cpu().item()
-            for name, value in losses.items()
+        return {name: value.detach().cpu().item() for name, value in losses.items()}, {
+            name: value.detach().cpu().item() for name, value in weights.items()
         }
 
     def _fit_prepared(
@@ -252,19 +269,27 @@ class _GasSourceEstimatorBase(ABC):
         if steps <= 0:
             raise ValueError("steps must be positive")
 
-        recorded: dict[str, list[float]] = {}
+        recorded_vals: dict[str, list[float]] = {}
+        recorded_weights: dict[str, list[float]] = {}
+
         for step in range(steps):
-            losses = self.training_step(n_collocation_points)
+            losses, weights = self.training_step(n_collocation_points)
             for name, value in losses.items():
-                recorded.setdefault(name, []).append(value)
+                recorded_vals.setdefault(name, []).append(value)
+            for name, value in weights.items():
+                recorded_weights.setdefault(name, []).append(value)
             if callback is not None:
                 callback(step, losses)
 
         self.history = EstimationHistory(
             losses={
                 name: np.asarray(values, dtype=float)
-                for name, values in recorded.items()
-            }
+                for name, values in recorded_vals.items()
+            },
+            weights={
+                name: np.asarray(weights, dtype=float)
+                for name, weights in recorded_weights.items()
+            },
         )
         return self.history
 
@@ -309,9 +334,7 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
         device = torch.device(config.device)
         bounds = (occupancy.lower_bound, occupancy.upper_bound)
         model = GasSourceModel(bounds, config).to(device)
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=config.learning_rate
-        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
         super().__init__(occupancy, config, model, optimizer)
         self.wind = wind
         self.laplace = JointSourceLaplace(
@@ -351,9 +374,7 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
         self._prepare_common(gas_samples)
         data = self._require_training_data()
         free_points = data.xy_free.detach().cpu().numpy()
-        self._known_uv_free = self._tensor(
-            self.wind.velocity_at(free_points)
-        )
+        self._known_uv_free = self._tensor(self.wind.velocity_at(free_points))
 
         if len(data.xy_open) == 0:
             self._known_xy_inflow = data.xy_open
@@ -364,13 +385,13 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
                 self.wind.velocity_at(open_points) * open_normals,
                 axis=1,
             )
-            self._known_xy_inflow = self._tensor(
-                open_points[normal_velocity < 0.0]
-            )
+            self._known_xy_inflow = self._tensor(open_points[normal_velocity < 0.0])
 
         return self._fit_prepared(steps, n_collocation_points, callback)
 
-    def training_step(self, n_collocation_points: int) -> dict[str, float]:
+    def training_step(
+        self, n_collocation_points: int
+    ) -> tuple[dict[str, float], dict[str, float]]:
         """Invalidate the known-wind Laplace approximation before training."""
         self.laplace.invalidate()
         return super().training_step(n_collocation_points)
@@ -381,13 +402,13 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
     ) -> torch.Tensor:
         """Return the joint concentration-source loss for last-layer parameters."""
         data = self._require_training_data()
-        expected_parameters = (self.model.c_net.net[-1].in_features + 1
-                               + self.model.q_net.net[-1].in_features + 1
-        )   
-        if (
-            params_last_layer.ndim != 1
-            or len(params_last_layer) != expected_parameters
-        ):
+        expected_parameters = (
+            self.model.c_net.net[-1].in_features
+            + 1
+            + self.model.q_net.net[-1].in_features
+            + 1
+        )
+        if params_last_layer.ndim != 1 or len(params_last_layer) != expected_parameters:
             raise ValueError(
                 f"params_last_layer must have shape ({expected_parameters},)"
             )
@@ -422,7 +443,8 @@ class GasSourceEstimator(_GasSourceEstimatorBase):
             * self.config.last_layer_prior_precision
             * torch.sum(params_last_layer**2)
         )
-        return sum(components.values()) + prior_loss
+        weighted, _ = self._weighted_loss_components(components)
+        return sum(weighted.values()) + prior_loss
 
     def source_uncertainty_reduction(
         self,
@@ -456,18 +478,19 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
         device = torch.device(config.device)
         bounds = (occupancy.lower_bound, occupancy.upper_bound)
         model = WindGasSourceModel(bounds, config).to(device)
-        gas_parameters = list(model.c_net.parameters()) + list(
-            model.q_net.parameters()
+        gas_parameters = list(model.c_net.parameters()) + list(model.q_net.parameters())
+        optimizer = torch.optim.Adam(
+            [
+                {"params": gas_parameters, "lr": config.learning_rate},
+                {
+                    "params": model.wind_net.parameters(),
+                    "lr": config.wind.learning_rate,
+                },
+            ]
         )
-        optimizer = torch.optim.Adam([
-            {"params": gas_parameters, "lr": config.learning_rate},
-            {"params": model.wind_net.parameters(), "lr": config.wind.learning_rate},
-        ])
         super().__init__(occupancy, config, model, optimizer)
         self.config = config
-        self.wind_distribution_loss = build_wind_loss(config.wind).to(
-            self.device
-        )
+        self.wind_distribution_loss = build_wind_loss(config.wind).to(self.device)
         self._xy_wind_measurements: torch.Tensor | None = None
         self._uv_measurements: torch.Tensor | None = None
 
@@ -536,7 +559,9 @@ class WindGasSourceEstimator(_GasSourceEstimatorBase):
 
     def predict_pressure(self, xy: np.ndarray) -> np.ndarray:
         if isinstance(self.config.wind, StreamFunctionWindConfig):
-            raise TypeError("The streamfunction configured by a StreamFunctionWindConfig has no pressure field")
+            raise TypeError(
+                "The streamfunction configured by a StreamFunctionWindConfig has no pressure field"
+            )
         values = self._predict(self._joint_model.wind_net, xy)
         return values[..., 2]
 
