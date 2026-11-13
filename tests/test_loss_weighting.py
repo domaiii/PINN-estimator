@@ -17,8 +17,11 @@ from source_estimation_pinn.estimation import (
     GasSourceConfig,
     GasSourceEstimator,
 )
+from source_estimation_pinn.estimation.loss_weighting import (
+    LearnedWeights,
+    StaticWeights,
+)
 from source_estimation_pinn.measurements import GasSampleSet
-from source_estimation_pinn.estimation.loss_weighting import LearnedWeights, StaticWeights
 
 REFERENCE = Path(__file__).parent / "test_data" / "loss_weighting_reference_static.csv"
 

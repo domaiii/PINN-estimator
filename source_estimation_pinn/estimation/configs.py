@@ -15,6 +15,9 @@ class GasSourceConfig:
     source_initial_value: float = 1e-3
     diffusion_constant: float = 1e-3
     dynamic_weights: bool = False
+    learned_weight_terms: tuple[str, ...] = ("gas_data", "ad", "inflow", "gas_wall", "nonfree")
+    gas_data_variance_floor: float = 0.0
+    ad_variance_floor: float = 0.0
     lambda_gas_data: float = 1.0
     lambda_ad: float = 1.0
     lambda_gas_wall: float = 1.0
@@ -26,6 +29,13 @@ class GasSourceConfig:
     device: str = "cpu"
 
     def __post_init__(self) -> None:
+        allowed_terms = {"gas_data", "ad", "inflow", "gas_wall", "nonfree"}
+        if (not set(self.learned_weight_terms) <= allowed_terms
+                or len(set(self.learned_weight_terms)) != len(self.learned_weight_terms)):
+            raise ValueError("learned_weight_terms must contain distinct supported loss names")
+        for floor in (self.gas_data_variance_floor, self.ad_variance_floor):
+            if not np.isfinite(floor) or floor < 0:
+                raise ValueError("variance floors must be finite and nonnegative")
         if self.concentration_hidden_layers < 1:
             raise ValueError("concentration_hidden_layers must be positive")
         if self.concentration_hidden_dim < 1:

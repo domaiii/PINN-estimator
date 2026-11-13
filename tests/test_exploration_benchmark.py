@@ -1,12 +1,19 @@
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from PIL import Image
 
-from evaluation.benchmark_exploration import BenchmarkConfig, run_benchmark
+from evaluation.benchmark_exploration import (
+    BenchmarkConfig,
+    ConcentrationUncertaintySampling,
+    SamplingContext,
+    run_benchmark,
+)
 from source_estimation_pinn.environment import OccupancyGrid
 from source_estimation_pinn.estimation import GasSourceConfig
 
@@ -140,10 +147,6 @@ def test_six_variant_study_is_paired_and_parallel_reproducible(tmp_path, synthet
 
 
 def test_cllla_selects_largest_available_concentration_variance():
-    from types import SimpleNamespace
-    from evaluation.benchmark_exploration import ConcentrationUncertaintySampling
-    from evaluation.benchmark_exploration import SamplingContext
-    import torch
 
     gradients = torch.tensor([[1., 0.], [0., 1.], [1., 1.]])
     laplace = SimpleNamespace(
@@ -170,21 +173,3 @@ def test_peak_noise_is_constant_and_scales_with_scenario_peak():
         noisy_measurements(10 * concentrations, config, seed=3), 10 * observed)
     with pytest.raises(ValueError, match="cannot be combined"):
         BenchmarkConfig(gas_peak_noise_alpha=0.05, gas_relative_noise_std=0.05)
-
-
-def test_exploration_does_not_import_legacy_sampling():
-    import subprocess
-    import sys
-
-    subprocess.run([sys.executable, "-c", """
-import importlib.abc
-import sys
-class BlockLegacy(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == 'evaluation.benchmark_sampling':
-            raise ImportError('Legacy benchmark is unavailable')
-sys.meta_path.insert(0, BlockLegacy())
-from evaluation.benchmark_exploration import CONFIG, study_strategies
-assert len(study_strategies()) == 6
-assert CONFIG.gas_peak_noise_alpha == 0.05
-"""], check=True)

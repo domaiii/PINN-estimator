@@ -163,6 +163,8 @@ class StrategySpec:
     factory: Callable
     label: str | None = None  # Optional display label, never used to choose behavior.
     dynamic_weights: bool | None = None  # None: use config.pinn.dynamic_weights.
+    pinn_overrides: dict = field(default_factory=dict)
+    data_variance_from_noise: bool = False
 
 
 class ConcentrationUncertaintySampling:
@@ -312,6 +314,18 @@ def _scenario_pinn_config(config, metadata):
     return replace(config.pinn, diffusion_constant=diffusivity)
 
 
+def _strategy_pinn_config(config, case, spec):
+    overrides = dict(spec.pinn_overrides)
+    if spec.dynamic_weights is not None:
+        overrides["dynamic_weights"] = spec.dynamic_weights
+    if spec.data_variance_from_noise:
+        if config.gas_peak_noise_alpha is None:
+            raise ValueError("noise-based variance floor requires peak-scaled noise")
+        overrides["gas_data_variance_floor"] = (
+            config.gas_peak_noise_alpha * float(np.max(case.concentrations))) ** 2
+    return replace(_scenario_pinn_config(config, case.metadata), **overrides)
+
+
 def _strategy_label(strategy, spec):
     return spec.label or getattr(strategy, "__name__", type(strategy).__name__)
 
@@ -414,14 +428,13 @@ def _run_trial(config, scenario_dir, seed, specs, output):
         observed = noisy_measurements(case.concentrations, config, seed)
         initial_samples = GasSampleSet(points[initial_indices].copy(), observed[initial_indices].copy())
         seen_labels = set()
-        modes = dict.fromkeys(config.pinn.dynamic_weights if spec.dynamic_weights is None
-                              else spec.dynamic_weights for spec in specs)
-        for dynamic in modes:
+        effective_configs = [_strategy_pinn_config(config, case, spec) for spec in specs]
+        for effective_pinn in dict.fromkeys(effective_configs):
+            dynamic = effective_pinn.dynamic_weights
             with torch.random.fork_rng(devices=devices):
                 torch.manual_seed(int(np.random.SeedSequence([seed, 1]).generate_state(1)[0]))
                 initial = UncertaintyBasedGasSourceEstimator(
-                    case.occupancy, case.wind, replace(
-                        _scenario_pinn_config(config, case.metadata), dynamic_weights=dynamic),
+                    case.occupancy, case.wind, effective_pinn,
                     initial_training_steps=config.initial_training_steps,
                     update_training_steps=config.update_training_steps,
                     n_collocation_points=config.n_collocation_points,
@@ -437,9 +450,7 @@ def _run_trial(config, scenario_dir, seed, specs, output):
                 train_state = torch.get_rng_state().clone()
                 cuda_state = torch.cuda.get_rng_state_all() if devices else None
                 for strategy_index, spec in enumerate(specs):
-                    selected_dynamic = (config.pinn.dynamic_weights if spec.dynamic_weights is None
-                                        else spec.dynamic_weights)
-                    if selected_dynamic != dynamic:
+                    if effective_configs[strategy_index] != effective_pinn:
                         continue
                     torch.set_rng_state(train_state)
                     if cuda_state is not None:
@@ -588,19 +599,16 @@ def run_benchmark(
     scenarios = []
     for directory in directories:
         metadata = json.loads((directory / "metadata.json").read_text())
-        concentrations = load_scenario(directory).concentrations if config.gas_peak_noise_alpha is not None else None
+        case = load_scenario(directory)
+        concentrations = case.concentrations if config.gas_peak_noise_alpha is not None else None
         scenarios.append({
             **({"peak_concentration": float(np.max(concentrations)),
                 "effective_gas_absolute_noise_std": config.gas_peak_noise_alpha * float(np.max(concentrations))}
                if concentrations is not None else {}),
             "directory": str(directory), "metadata": metadata,
             "effective_pinn": asdict(_scenario_pinn_config(config, metadata)),
-            "effective_pinn_by_strategy": [
-                asdict(replace(_scenario_pinn_config(config, metadata),
-                               dynamic_weights=config.pinn.dynamic_weights
-                               if spec.dynamic_weights is None else spec.dynamic_weights))
-                for spec in specs
-            ],
+            "effective_pinn_by_strategy": [asdict(_strategy_pinn_config(config, case, spec))
+                                           for spec in specs],
             "gas_sha256": hashlib.sha256(
                 (directory / metadata["files"]["gas"]).read_bytes()).hexdigest(),
         })
@@ -635,7 +643,9 @@ def run_benchmark(
         "strategies": [{"factory": getattr(s.factory, "__qualname__", repr(s.factory)),
                         "module": getattr(s.factory, "__module__", None), "label": s.label,
                         "dynamic_weights": config.pinn.dynamic_weights
-                        if s.dynamic_weights is None else s.dynamic_weights}
+                        if s.dynamic_weights is None else s.dynamic_weights,
+                        "pinn_overrides": s.pinn_overrides,
+                        "data_variance_from_noise": s.data_variance_from_noise}
                        for s in specs],
         "scenarios": scenarios,
         "noise_model": ("Gaussian: sigma=gas_peak_noise_alpha*max(C_true) over scenario free grid; shared by location"
@@ -685,4 +695,37 @@ def run_exploration_benchmark(config: BenchmarkConfig = CONFIG) -> Path:
 
 
 if __name__ == "__main__":
-    run_exploration_benchmark()
+    import argparse
+    parser = argparse.ArgumentParser()
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--weighting-diagnostic", action="store_true",
+                       help="Paired Random comparison: static, data/PDE adaptive, data/PDE with floors")
+    modes.add_argument("--data-weighting-diagnostic", action="store_true",
+                       help="Paired Random comparison: static versus adaptive data weight with noise floor")
+    args = parser.parse_args()
+    if args.weighting_diagnostic or args.data_weighting_diagnostic:
+        prefix = "data_weighting_diagnostic" if args.data_weighting_diagnostic else "weighting_diagnostic"
+        diagnostic = replace(CONFIG,
+            scenarios=("example_apartment/scenario_source_1.5_1_seed_7",),
+            seeds=(0, 1, 2, 3), parallel_runs=2,
+            output_dir=PROJECT_ROOT / "evaluation/results" / datetime.now().strftime(
+                f"{prefix}_%Y%m%d_%H%M%S_%f"))
+        terms = {"learned_weight_terms": ("gas_data", "ad")}
+        strategies = (
+            StrategySpec(RandomSampling, "Random_static", dynamic_weights=False),
+            StrategySpec(RandomSampling, "Random_data_pde", dynamic_weights=True,
+                         pinn_overrides=terms),
+            StrategySpec(RandomSampling, "Random_data_pde_floored", dynamic_weights=True,
+                         pinn_overrides={**terms, "ad_variance_floor": 1e-3},
+                         data_variance_from_noise=True),
+        )
+        if args.data_weighting_diagnostic:
+            strategies = (
+                strategies[0],
+                StrategySpec(RandomSampling, "Random_data_only_floored", dynamic_weights=True,
+                             pinn_overrides={"learned_weight_terms": ("gas_data",)},
+                             data_variance_from_noise=True),
+            )
+        run_benchmark(diagnostic, strategy_factories=strategies)
+    else:
+        run_exploration_benchmark()

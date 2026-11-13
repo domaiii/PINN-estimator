@@ -28,47 +28,43 @@ class StaticWeights(torch.nn.Module):
 
 
 class LearnedWeights(StaticWeights):
+    """Learn selected residual variances, optionally above fixed variance floors."""
+
+    PARAMETER_NAMES = {"gas_data": "log_eps_data", "ad": "log_eps_ad",
+                       "inflow": "log_eps_inflow", "gas_wall": "log_eps_gas_wall",
+                       "nonfree": "log_eps_nonfree"}
+
     def __init__(self, config: GasSourceConfig):
         super().__init__(config)
+        self.terms = config.learned_weight_terms
+        self.variance_floors = {"gas_data": config.gas_data_variance_floor,
+                                "ad": config.ad_variance_floor}
+        initial = super().forward()
+        for name in self.terms:
+            weight = float(initial[name])
+            if not 0.0 < weight < float("inf"):
+                raise ValueError(f"lambda_{name} must be finite and positive for learned weights")
+            variance = 1.0 / (2.0 * weight) - self.variance_floors.get(name, 0.0)
+            if variance <= 0:
+                raise ValueError(f"variance floor for {name} must be below its initial variance")
+            setattr(self, self.PARAMETER_NAMES[name], torch.nn.Parameter(
+                0.5 * torch.log(torch.tensor(variance))))
 
-        for name in ("lambda_gas_data", "lambda_ad", "lambda_inflow",
-                     "lambda_gas_wall", "lambda_nonfree"):
-            value = getattr(config, name)
-            if not 0.0 < value < float("inf"):
-                raise ValueError(f"{name} must be finite and positive for learned weights")
-
-        self.log_eps_data = torch.nn.Parameter(
-            -0.5 * torch.log(torch.tensor(2.0 * config.lambda_gas_data))
-        )
-        self.log_eps_ad = torch.nn.Parameter(
-            -0.5 * torch.log(torch.tensor(2.0 * config.lambda_ad))
-        )
-        self.log_eps_inflow = torch.nn.Parameter(
-            -0.5 * torch.log(torch.tensor(2.0 * config.lambda_inflow))
-        )
-        self.log_eps_gas_wall = torch.nn.Parameter(
-            -0.5 * torch.log(torch.tensor(2.0 * config.lambda_gas_wall))
-        )
-        self.log_eps_nonfree = torch.nn.Parameter(
-            -0.5 * torch.log(torch.tensor(2.0 * config.lambda_nonfree))
-        )
+    def _log_variance(self, name):
+        log_variance = 2.0 * getattr(self, self.PARAMETER_NAMES[name])
+        floor = self.variance_floors.get(name, 0.0)
+        if floor:
+            # log(floor + exp(2s)), evaluated stably for very small residual scales.
+            log_variance = torch.logaddexp(log_variance,
+                                           log_variance.new_tensor(floor).log())
+        return log_variance
 
     def forward(self):
         weights = super().forward()
-        weights["gas_data"] = 0.5 * torch.exp(-2.0 * self.log_eps_data)
-        weights["ad"] = 0.5 * torch.exp(-2.0 * self.log_eps_ad)
-        weights["inflow"] = 0.5 * torch.exp(-2.0 * self.log_eps_inflow)
-        weights["gas_wall"] = 0.5 * torch.exp(-2.0 * self.log_eps_gas_wall)
-        weights["nonfree"] = 0.5 * torch.exp(-2.0 * self.log_eps_nonfree)
+        for name in self.terms:
+            weights[name] = 0.5 * torch.exp(-self._log_variance(name))
         return weights
 
     def log_term(self, active_components=None):
-        log_eps = {
-            "gas_data": self.log_eps_data,
-            "ad": self.log_eps_ad,
-            "inflow": self.log_eps_inflow,
-            "gas_wall": self.log_eps_gas_wall,
-            "nonfree": self.log_eps_nonfree,
-        }
-        return sum(value for name, value in log_eps.items()
+        return sum(0.5 * self._log_variance(name) for name in self.terms
                    if active_components is None or name in active_components)

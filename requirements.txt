@@ -7,3 +7,6 @@ Pillow
 PyYAML
 scipy
 torch
+trimesh
+shapely
+rtree
