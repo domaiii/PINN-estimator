@@ -2,9 +2,10 @@ services:
   python_pinn:
     container_name: pinn-container
     build: .
-    image: python:3.14-slim
     volumes:
-        - .:/app
+      - .:/app
+    ports:
+      - "8888:8888"
     working_dir: /app
     tty: true            
     stdin_open: true    

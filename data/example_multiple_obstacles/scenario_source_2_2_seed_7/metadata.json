@@ -1,0 +1,28 @@
+{
+  "model": "Gaussian filament time average",
+  "occupancy": "../occupancy.yaml",
+  "wind": "../wind_gt.csv",
+  "files": {
+    "gas": "gas.csv",
+    "preview": "preview.png"
+  },
+  "source": {
+    "position": [
+      2.0,
+      2.0
+    ],
+    "rate": 1.0,
+    "sigma": 0.1
+  },
+  "filaments_per_sec": 30.0,
+  "diffusion_speed_std": 0.9,
+  "initial_sigma": 0.05,
+  "diffusivity": 0.005,
+  "max_age": 100.0,
+  "dt": 0.05,
+  "warmup_seconds": 30.0,
+  "averaging_seconds": 10.0,
+  "sample_every_seconds": 1.0,
+  "seed": 7,
+  "n_points": 5600
+}

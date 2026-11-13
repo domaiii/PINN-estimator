@@ -1,0 +1,13 @@
+image: occupancy.pgm
+resolution: 0.015
+origin:
+- -1.2000000476837158
+- -1.2000000476837158
+- 0.0
+negate: 0
+occupied_thresh: 0.9
+free_thresh: 0.1
+metadata:
+  setup: setupC
+  slice_height: 0.1
+  geometry: setupC.stl

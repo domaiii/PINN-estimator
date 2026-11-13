@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM dolfinx/dolfinx:v0.11.0
 
 WORKDIR /app
 
@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     xvfb \
     git \
+    gmsh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -17,7 +18,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["bash"]
 EXPOSE 8888
 
 CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
